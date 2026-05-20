@@ -46,6 +46,10 @@ def build_image() -> modal.Image:
             "mistral_common>=1.10.0",
             "accelerate",  # for device_map="auto" multi-GPU loading
             "tiktoken",
+            # transformers' finegrained_fp8 path dispatches via the `kernels`
+            # package for the actual fp8 matmul; Leanstral can't forward
+            # without it.
+            "kernels",
         ])
         .env({"PYTHONPATH": "/opt/rotorquant"})
         # Local mount: every `modal run` ships the current working tree, so
