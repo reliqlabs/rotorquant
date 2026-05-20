@@ -34,7 +34,8 @@ from modal_apps._common import (
 
 
 app = modal.App("leanstral-eval", image=build_image())
-GPU = "H200"
+# Same constraint as calibrate_rotorquant: bf16 dequantized model = 238 GB.
+GPU = "H100:3"
 TIMEOUT_S = 4 * 60 * 60
 SHARED_VOLUMES = {
     LEANSTRAL_MODELS_PATH: LEANSTRAL_MODELS_VOL,
@@ -113,19 +114,27 @@ def run_eval(max_tokens: int = 256, output_tag: str = "fp8-baseline") -> dict:
     t0 = time.time()
     tokenizer = AutoTokenizer.from_pretrained(HF_INTERMEDIATE_DIR)
     cfg = AutoConfig.from_pretrained(HF_INTERMEDIATE_DIR)
+    # Mirror calibrate_rotorquant: dequantize FP8 -> bf16 to avoid the
+    # kernels-package Triton shape bug. Needs H100x3 for the 238 GB bf16 model.
+    qc = getattr(cfg, "quantization_config", None)
+    if qc is not None:
+        if hasattr(qc, "activation_scheme"):
+            qc.activation_scheme = "dynamic"
+            qc.dequantize = True
+        elif isinstance(qc, dict):
+            qc["activation_scheme"] = "dynamic"
+            qc["dequantize"] = True
     if cfg.model_type == "mistral3":
         from transformers import Mistral3ForConditionalGeneration
         model = Mistral3ForConditionalGeneration.from_pretrained(
-            HF_INTERMEDIATE_DIR,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
+            HF_INTERMEDIATE_DIR, config=cfg,
+            torch_dtype=torch.bfloat16, device_map="auto",
         )
     else:
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(
-            HF_INTERMEDIATE_DIR,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
+            HF_INTERMEDIATE_DIR, config=cfg,
+            torch_dtype=torch.bfloat16, device_map="auto",
         )
     model.eval()
     print(f"[eval] load() in {time.time() - t0:.1f}s", flush=True)
