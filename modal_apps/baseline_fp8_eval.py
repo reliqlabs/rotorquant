@@ -153,15 +153,18 @@ def run_eval(max_tokens: int = 256, output_tag: str = "fp8-baseline") -> dict:
     with csv_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
+        # Force the Mistral `<s>[INST] ... [/INST]` wrap explicitly. The first
+        # three prompts of the prior run scored 0/2 because
+        # `tokenizer.apply_chat_template` silently returned the unwrapped
+        # user message (the streaming-converted tokenizer ships with an
+        # empty chat_template attribute even though chat_template.jinja
+        # exists on disk). The literal `[INST]` form is what Leanstral was
+        # trained on; produced valid Lean code in the local Q3 smoke.
         for i, p in enumerate(PROMPTS):
             print(f"[eval] [{i + 1}/{len(PROMPTS)}] {p['name']}", flush=True)
-            try:
-                prompt = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": p["user"]}],
-                    tokenize=False, add_generation_prompt=True,
-                )
-            except Exception:
-                prompt = f"<s>[INST] {p['user']} [/INST]"
+            prompt = f"<s>[INST] {p['user']} [/INST]"
+            if i == 0:
+                print(f"[eval]   formatted prompt sample:\n{prompt!r}", flush=True)
 
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             t1 = time.time()
