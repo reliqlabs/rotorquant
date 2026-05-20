@@ -61,15 +61,34 @@ def build_image() -> modal.Image:
 def prepare_hf_intermediate_if_missing():
     """Convert the consolidated Leanstral checkpoint to HF format on the volume.
 
-    Idempotent: if `HF_INTERMEDIATE_DIR/config.json` already exists, skip.
-    First run is ~20-40 min (consolidated → HF FP8 via streaming converter).
-    Subsequent runs are no-ops since the volume persists.
+    Idempotent: if weights AND tokenizer are already on the volume, skip.
+    Three states it handles cleanly:
+      1. Nothing on volume — full prep (download + convert + tokenizer).
+      2. Weights present but tokenizer missing (e.g., from an earlier broken
+         run) — write only the tokenizer/processor.
+      3. Everything present — no-op.
     """
     import os
-    import sys
 
-    if os.path.exists(f"{HF_INTERMEDIATE_DIR}/config.json"):
+    has_weights = os.path.exists(f"{HF_INTERMEDIATE_DIR}/config.json")
+    has_tokenizer = os.path.exists(f"{HF_INTERMEDIATE_DIR}/tokenizer.json")
+    if has_weights and has_tokenizer:
         print(f"[prep] {HF_INTERMEDIATE_DIR} already prepared, skipping")
+        return
+
+    if has_weights and not has_tokenizer:
+        print(f"[prep] weights present, tokenizer missing — writing tokenizer only")
+        from modal_apps._convert_mistral4_weight_to_hf import (  # type: ignore
+            convert_and_write_processor_and_tokenizer,
+        )
+        from transformers import AutoConfig
+        from pathlib import Path as _Path
+        config = AutoConfig.from_pretrained(HF_INTERMEDIATE_DIR)
+        convert_and_write_processor_and_tokenizer(
+            _Path(CONSOLIDATED_DIR), _Path(HF_INTERMEDIATE_DIR), config,
+        )
+        LEANSTRAL_MODELS_VOL.commit()
+        print(f"[prep] tokenizer written")
         return
 
     print(f"[prep] downloading consolidated checkpoint to {CONSOLIDATED_DIR}")
@@ -101,4 +120,5 @@ def prepare_hf_intermediate_if_missing():
     convert_and_write_processor_and_tokenizer(
         _Path(CONSOLIDATED_DIR), _Path(HF_INTERMEDIATE_DIR), config,
     )
+    LEANSTRAL_MODELS_VOL.commit()
     print(f"[prep] done, HF intermediate at {HF_INTERMEDIATE_DIR}")
