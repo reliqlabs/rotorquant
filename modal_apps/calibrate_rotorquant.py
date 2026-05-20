@@ -161,13 +161,36 @@ def calibrate(
     print(f"[calib] prefilling {input_ids.shape[1]} tokens", flush=True)
 
     # Use the model's normal `use_cache=True` path so transformers populates
-    # a DynamicCache with the actual K used inside attention — no fragile
-    # per-architecture hooks needed.
+    # a cache with the actual K used inside attention — no fragile per-
+    # architecture hooks needed.
     t1 = time.time()
     with torch.no_grad():
         out = model(input_ids, use_cache=True, return_dict=True)
     past_kv = out.past_key_values
     print(f"[calib] forward pass in {time.time() - t1:.1f}s", flush=True)
+    # Introspect the cache once so we know what we're dealing with for MLA.
+    print(f"[calib] past_kv type: {type(past_kv).__name__}", flush=True)
+    print(f"[calib] past_kv attrs: {sorted(a for a in dir(past_kv) if not a.startswith('_'))}",
+          flush=True)
+    if hasattr(past_kv, "key_cache"):
+        kc = past_kv.key_cache
+        kc_len = len(kc) if hasattr(kc, "__len__") else "?"
+        print(f"[calib] past_kv.key_cache len={kc_len}", flush=True)
+        for li in (0, len(kc) - 1) if hasattr(kc, "__len__") else ():
+            entry = kc[li] if li < len(kc) else None
+            print(f"[calib]   key_cache[{li}]: {type(entry).__name__} "
+                  f"shape={getattr(entry, 'shape', None)}", flush=True)
+    # Mistral4 uses MLA — likely a DynamicMLACache with k_nope_cache, k_pe_cache,
+    # value_cache, or a single compressed kv_cache.
+    for attr in ("k_nope_cache", "k_pe_cache", "compressed_kv_cache",
+                 "kv_a_cache", "kv_b_cache", "value_cache"):
+        if hasattr(past_kv, attr):
+            v = getattr(past_kv, attr)
+            v_len = len(v) if hasattr(v, "__len__") else "?"
+            print(f"[calib] past_kv.{attr}: len={v_len}", flush=True)
+            if hasattr(v, "__len__") and len(v) > 0:
+                print(f"[calib]   {attr}[0]: {type(v[0]).__name__} "
+                      f"shape={getattr(v[0], 'shape', None)}", flush=True)
 
     # past_kv may be a DynamicCache or a list-of-tuples depending on transformers
     # version. Normalize to a list of K tensors per layer.
