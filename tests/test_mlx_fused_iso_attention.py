@@ -290,3 +290,90 @@ def test_iso_fused_qk_matches_reference(mode, bits):
     # Loose tolerance because the kernel runs everything in float32 (matching
     # ref) but rounds via shared-mem load/stores.
     assert diff < 5e-4, f"fused vs ref diff={diff:.3e}  (mode={mode}, bits={bits})"
+
+
+@pytest.mark.parametrize("mode", ["full", "fast"])
+@pytest.mark.parametrize("bits", [2, 3, 4])
+def test_iso_fused_sv_matches_reference(mode, bits):
+    """Fused SV value sum should match `iso_decompress + (probs @ V)` reference."""
+    from turboquant.mlx_fused_iso_attention import (
+        iso_compress, iso_decompress, iso_fused_sv_values,
+        make_random_quaternions, _ISO_CODEBOOKS,
+    )
+    mx.random.seed(0)
+    B, H, T, D = 1, 2, 40, 128
+    n_groups = D // 4
+    q_L = make_random_quaternions(n_groups, seed=21)
+    q_R = make_random_quaternions(n_groups, seed=22) if mode == "full" else None
+    centroids = _ISO_CODEBOOKS[bits]
+
+    V = mx.random.normal((B * H * T, D)).astype(mx.float32)
+    v_packed_flat, v_norms_flat = iso_compress(V, bits, q_L, q_R, centroids)
+    v_packed = v_packed_flat.reshape(B, H, T, -1)
+    v_norms = v_norms_flat.reshape(B, H, T)
+
+    # softmax-style probability vector (random but normalized per head).
+    raw = mx.random.uniform(shape=(B, H, 1, T))
+    probs = raw / mx.sum(raw, axis=-1, keepdims=True)
+
+    # Reference: decompress V, do matmul against probs.
+    V_dec = iso_decompress(v_packed_flat, v_norms_flat, D, bits, q_L, q_R, centroids)
+    V_dec = V_dec.reshape(B, H, T, D)
+    ref = probs @ V_dec  # (B, H, 1, D)
+
+    fused = iso_fused_sv_values(probs, v_packed, v_norms, centroids, q_L, q_R, D, bits)
+    mx.eval(ref, fused)
+    diff = mx.max(mx.abs(ref - fused)).item()
+    assert diff < 5e-4, f"fused SV vs ref diff={diff:.3e}  (mode={mode}, bits={bits})"
+
+
+# ── Flash decode (QK + softmax + SV in one kernel) ─────────────────────────
+
+
+@pytest.mark.parametrize("mode", ["full", "fast"])
+@pytest.mark.parametrize("bits", [2, 3, 4])
+@pytest.mark.parametrize("T", [64, 300])  # 300 exercises multi-tile + ragged last
+def test_iso_flash_decode_matches_reference(mode, bits, T):
+    """Fused flash decode == softmax(QK·scale) · V on the decompressed cache."""
+    import math
+    from turboquant.mlx_fused_iso_attention import (
+        iso_compress, iso_decompress, iso_flash_decode,
+        make_random_quaternions, _ISO_CODEBOOKS,
+    )
+    mx.random.seed(0)
+    B, H, D = 1, 2, 128
+    n_groups = D // 4
+    q_L = make_random_quaternions(n_groups, seed=31)
+    q_R = make_random_quaternions(n_groups, seed=32) if mode == "full" else None
+    centroids = _ISO_CODEBOOKS[bits]
+
+    K = mx.random.normal((B * H * T, D)).astype(mx.float32)
+    V = mx.random.normal((B * H * T, D)).astype(mx.float32)
+    k_packed_flat, k_norms_flat = iso_compress(K, bits, q_L, q_R, centroids)
+    v_packed_flat, v_norms_flat = iso_compress(V, bits, q_L, q_R, centroids)
+    k_packed = k_packed_flat.reshape(B, H, T, -1)
+    k_norms = k_norms_flat.reshape(B, H, T)
+    v_packed = v_packed_flat.reshape(B, H, T, -1)
+    v_norms = v_norms_flat.reshape(B, H, T)
+
+    q = mx.random.normal((B, H, 1, D)).astype(mx.float32)
+    scale = 1.0 / math.sqrt(D)
+
+    # Reference path: decompress, scaled-dot-product attention, no tricks.
+    K_dec = iso_decompress(k_packed_flat, k_norms_flat, D, bits, q_L, q_R, centroids)
+    V_dec = iso_decompress(v_packed_flat, v_norms_flat, D, bits, q_L, q_R, centroids)
+    K_dec = K_dec.reshape(B, H, T, D)
+    V_dec = V_dec.reshape(B, H, T, D)
+    scores = (q @ K_dec.swapaxes(-1, -2)) * scale  # (B, H, 1, T)
+    probs = mx.softmax(scores, axis=-1)
+    ref = probs @ V_dec  # (B, H, 1, D)
+
+    fused = iso_flash_decode(
+        q, k_packed, k_norms, v_packed, v_norms,
+        centroids, q_L, q_R, scale, D, bits,
+    )
+    mx.eval(ref, fused)
+    diff = mx.max(mx.abs(ref - fused)).item()
+    # Looser tolerance — flash decode runs an online softmax across tiles
+    # which accumulates a bit more rounding than a one-shot softmax.
+    assert diff < 5e-3, f"flash decode vs ref diff={diff:.3e}  (mode={mode}, bits={bits}, T={T})"

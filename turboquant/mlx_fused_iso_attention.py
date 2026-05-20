@@ -397,6 +397,152 @@ ISO_FUSED_QK_KERNEL = """
 _iso_fused_qk_kernel = None
 
 
+ISO_FUSED_SV_KERNEL = """
+    uint head_idx = threadgroup_position_in_grid.y;
+    uint elem = thread_position_in_threadgroup.x;
+    uint dim = dims[0];
+    uint seq_len = dims[1];
+    uint n_heads = dims[2];
+    uint bits = dims[3];
+    uint vals_per_word = dims[4];
+    uint packed_dim = dims[5];
+    uint has_qR = dims[6];
+    uint bit_mask = (1u << bits) - 1u;
+
+    float acc = 0.0f;
+    threadgroup float v_shared[1024];
+
+    for (uint seq_idx = 0; seq_idx < seq_len; seq_idx++) {
+        // Unpack V[seq_idx][elem] and apply per-token norm.
+        uint word_idx = elem / vals_per_word;
+        uint pos_in_word = elem % vals_per_word;
+        uint word = packed[(head_idx * seq_len + seq_idx) * packed_dim + word_idx];
+        uint idx = (word >> (pos_in_word * bits)) & bit_mask;
+        float val = centroids[idx] * norms[head_idx * seq_len + seq_idx];
+
+        v_shared[elem] = val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Inverse quaternion sandwich on each 4-group (per-token).
+        if (elem % 4 == 0) {
+            uint group_idx = elem / 4;
+            uint qbase = group_idx * 4;
+
+            float v0 = v_shared[elem];
+            float v1 = v_shared[elem + 1];
+            float v2 = v_shared[elem + 2];
+            float v3 = v_shared[elem + 3];
+
+            float qlw =  q_L[qbase + 0];
+            float qlx = -q_L[qbase + 1];
+            float qly = -q_L[qbase + 2];
+            float qlz = -q_L[qbase + 3];
+
+            float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
+            float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
+            float ty = qlw * v2 - qlx * v3 + qly * v0 + qlz * v1;
+            float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
+
+            if (has_qR == 1u) {
+                float qrw = q_R[qbase + 0];
+                float qrx = q_R[qbase + 1];
+                float qry = q_R[qbase + 2];
+                float qrz = q_R[qbase + 3];
+                v_shared[elem]     = tw * qrw - tx * qrx - ty * qry - tz * qrz;
+                v_shared[elem + 1] = tw * qrx + tx * qrw + ty * qrz - tz * qry;
+                v_shared[elem + 2] = tw * qry - tx * qrz + ty * qrw + tz * qrx;
+                v_shared[elem + 3] = tw * qrz + tx * qry - ty * qrx + tz * qrw;
+            } else {
+                v_shared[elem]     = tw;
+                v_shared[elem + 1] = tx;
+                v_shared[elem + 2] = ty;
+                v_shared[elem + 3] = tz;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Accumulate softmax-weighted V into per-thread (per-elem) acc.
+        float prob = (float)probs[head_idx * seq_len + seq_idx];
+        acc += prob * v_shared[elem];
+    }
+
+    out[head_idx * dim + elem] = (T)acc;
+"""
+
+
+_iso_fused_sv_kernel = None
+
+
+def iso_fused_sv_values(
+    probs: mx.array,
+    v_packed: mx.array,
+    v_norms: mx.array,
+    centroids: mx.array,
+    q_L: mx.array,
+    q_R: Optional[mx.array],
+    dim: int,
+    bits: int,
+) -> mx.array:
+    """Weighted V sum: sum over T of (prob[t] · iso-unrotated V[t]).
+
+    Mirrors `planar_fused_sv_values` in mlx_fused_planar_attention.py but uses
+    the quaternion sandwich rotation. Same caveat about ≤ 1024-thread shared
+    memory budget — for d > 256 use the tiled variant (TBD as a follow-up).
+
+    Args:
+        probs: (B, H, 1, T) float — softmax probabilities from the QK step.
+        v_packed: (B, H, T, packed_dim) uint32 — packed iso-quantized V cache.
+        v_norms:  (B, H, T) float32 — per-token V norm.
+        centroids, q_L, q_R, dim, bits: as for `iso_fused_qk_scores`.
+
+    Returns:
+        out (B, H, 1, dim) float32 — attention-weighted V.
+    """
+    global _iso_fused_sv_kernel
+    if _iso_fused_sv_kernel is None:
+        _iso_fused_sv_kernel = mx.fast.metal_kernel(
+            name="iso_fused_sv",
+            input_names=[
+                "probs", "packed", "norms", "centroids",
+                "q_L", "q_R", "dims",
+            ],
+            output_names=["out"],
+            source=ISO_FUSED_SV_KERNEL,
+        )
+
+    B = probs.shape[0]
+    H = probs.shape[1]
+    seq_len = v_norms.shape[2]
+    p_dim = v_packed.shape[-1]
+    vpw = _VALS_PER_WORD[bits]
+    assert dim % 4 == 0 and dim <= 1024
+    assert q_L.shape[0] * 4 == dim
+
+    has_qR = 1 if q_R is not None else 0
+    q_R_flat = (q_R if q_R is not None else mx.zeros_like(q_L)).astype(mx.float32).reshape(-1)
+    q_L_flat = q_L.astype(mx.float32).reshape(-1)
+    dims_arr = mx.array(
+        [dim, seq_len, B * H, bits, vpw, p_dim, has_qR],
+        dtype=mx.uint32,
+    )
+
+    outputs = _iso_fused_sv_kernel(
+        inputs=[
+            probs.astype(mx.float32).reshape(B * H * seq_len),
+            v_packed.astype(mx.uint32).reshape(B * H * seq_len * p_dim),
+            v_norms.astype(mx.float32).reshape(B * H * seq_len),
+            centroids, q_L_flat, q_R_flat, dims_arr,
+        ],
+        template=[("T", mx.float32)],
+        # 1 threadgroup per head; dim threads per threadgroup.
+        grid=(dim, B * H, 1),
+        threadgroup=(dim, 1, 1),
+        output_shapes=[(B * H * dim,)],
+        output_dtypes=[mx.float32],
+    )
+    return outputs[0].reshape(B, H, 1, dim)
+
+
 def iso_fused_qk_scores(
     query: mx.array,
     k_packed: mx.array,
@@ -474,6 +620,294 @@ def iso_fused_qk_scores(
         output_dtypes=[mx.float32],
     )
     return outputs[0].reshape(B, H, 1, seq_len)
+
+
+# ── Fully fused flash decode: QK + online softmax + SV in one kernel ────────
+#
+# Per-tile kernel mirrors `PLANAR_FLASH_DECODE_KERNEL` in the planar module.
+# Reads packed K and V exactly once, never materializes the decompressed
+# tensors in device memory. Output is partial-per-tile + log-sum-exp metadata;
+# the Python wrapper merges tiles into the final attention output.
+
+
+ISO_TILE_SIZE = 256
+
+
+ISO_FLASH_DECODE_KERNEL = """
+    uint tile_idx = threadgroup_position_in_grid.x;
+    uint head_idx = threadgroup_position_in_grid.y;
+    uint elem = thread_position_in_threadgroup.x;
+    uint dim = dims[0];
+    uint seq_len = dims[1];
+    uint n_heads = dims[2];
+    uint bits = dims[3];
+    uint vals_per_word = dims[4];
+    uint packed_dim = dims[5];
+    uint tile_size = dims[6];
+    uint has_qR = dims[7];
+    uint bit_mask = (1u << bits) - 1u;
+
+    uint tile_start = tile_idx * tile_size;
+    uint tile_end = tile_start + tile_size;
+    if (tile_end > seq_len) tile_end = seq_len;
+
+    // Load Q once for this tile.
+    threadgroup float q_shared[1024];
+    q_shared[elem] = (float)query[head_idx * dim + elem];
+
+    // Online softmax shared singletons (broadcast from thread 0).
+    threadgroup float s_corr[1];
+    threadgroup float s_expsc[1];
+    threadgroup float s_max[1];
+    threadgroup float s_sum[1];
+    if (elem == 0) {
+        s_max[0] = -1e30f;
+        s_sum[0] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float kv_shared[1024];
+    threadgroup float dot_shared[1024];
+    float acc_v = 0.0f;
+
+    for (uint seq_idx = tile_start; seq_idx < tile_end; seq_idx++) {
+        // ── Unpack K element + apply norm ────────────────────────────────
+        uint word_idx = elem / vals_per_word;
+        uint pos_in_word = elem % vals_per_word;
+        uint k_word = k_packed[(head_idx * seq_len + seq_idx) * packed_dim + word_idx];
+        uint k_idx = (k_word >> (pos_in_word * bits)) & bit_mask;
+        float k_val = centroids[k_idx] * k_norms[head_idx * seq_len + seq_idx];
+
+        kv_shared[elem] = k_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Inverse quaternion sandwich on K (4-block per thread%4==0) ───
+        if (elem % 4 == 0) {
+            uint group_idx = elem / 4;
+            uint qbase = group_idx * 4;
+
+            float v0 = kv_shared[elem];
+            float v1 = kv_shared[elem + 1];
+            float v2 = kv_shared[elem + 2];
+            float v3 = kv_shared[elem + 3];
+
+            float qlw =  q_L[qbase + 0];
+            float qlx = -q_L[qbase + 1];
+            float qly = -q_L[qbase + 2];
+            float qlz = -q_L[qbase + 3];
+
+            float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
+            float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
+            float ty = qlw * v2 - qlx * v3 + qly * v0 + qlz * v1;
+            float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
+
+            if (has_qR == 1u) {
+                float qrw = q_R[qbase + 0];
+                float qrx = q_R[qbase + 1];
+                float qry = q_R[qbase + 2];
+                float qrz = q_R[qbase + 3];
+                kv_shared[elem]     = tw * qrw - tx * qrx - ty * qry - tz * qrz;
+                kv_shared[elem + 1] = tw * qrx + tx * qrw + ty * qrz - tz * qry;
+                kv_shared[elem + 2] = tw * qry - tx * qrz + ty * qrw + tz * qrx;
+                kv_shared[elem + 3] = tw * qrz + tx * qry - ty * qrx + tz * qrw;
+            } else {
+                kv_shared[elem]     = tw;
+                kv_shared[elem + 1] = tx;
+                kv_shared[elem + 2] = ty;
+                kv_shared[elem + 3] = tz;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── QK dot product + tree reduce ─────────────────────────────────
+        dot_shared[elem] = q_shared[elem] * kv_shared[elem];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = dim / 2; stride > 0; stride >>= 1) {
+            if (elem < stride) dot_shared[elem] += dot_shared[elem + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // ── Online softmax update (thread 0 broadcasts) ──────────────────
+        if (elem == 0) {
+            float score = dot_shared[0] * scale[0];
+            float old_max = s_max[0];
+            float new_max = (score > old_max) ? score : old_max;
+            float corr = exp(old_max - new_max);
+            float es = exp(score - new_max);
+            s_max[0] = new_max;
+            s_sum[0] = s_sum[0] * corr + es;
+            s_corr[0] = corr;
+            s_expsc[0] = es;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float corr = s_corr[0];
+        float es = s_expsc[0];
+
+        // ── Rescale accumulated V by softmax correction ──────────────────
+        acc_v = acc_v * corr;
+
+        // ── Unpack V element + apply norm ────────────────────────────────
+        uint v_word = v_packed[(head_idx * seq_len + seq_idx) * packed_dim + word_idx];
+        uint v_idx = (v_word >> (pos_in_word * bits)) & bit_mask;
+        float v_val = centroids[v_idx] * v_norms[head_idx * seq_len + seq_idx];
+
+        kv_shared[elem] = v_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Inverse quaternion sandwich on V ─────────────────────────────
+        if (elem % 4 == 0) {
+            uint group_idx = elem / 4;
+            uint qbase = group_idx * 4;
+
+            float v0 = kv_shared[elem];
+            float v1 = kv_shared[elem + 1];
+            float v2 = kv_shared[elem + 2];
+            float v3 = kv_shared[elem + 3];
+
+            float qlw =  q_L[qbase + 0];
+            float qlx = -q_L[qbase + 1];
+            float qly = -q_L[qbase + 2];
+            float qlz = -q_L[qbase + 3];
+
+            float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
+            float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
+            float ty = qlw * v2 - qlx * v3 + qly * v0 + qlz * v1;
+            float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
+
+            if (has_qR == 1u) {
+                float qrw = q_R[qbase + 0];
+                float qrx = q_R[qbase + 1];
+                float qry = q_R[qbase + 2];
+                float qrz = q_R[qbase + 3];
+                kv_shared[elem]     = tw * qrw - tx * qrx - ty * qry - tz * qrz;
+                kv_shared[elem + 1] = tw * qrx + tx * qrw + ty * qrz - tz * qry;
+                kv_shared[elem + 2] = tw * qry - tx * qrz + ty * qrw + tz * qrx;
+                kv_shared[elem + 3] = tw * qrz + tx * qry - ty * qrx + tz * qrw;
+            } else {
+                kv_shared[elem]     = tw;
+                kv_shared[elem + 1] = tx;
+                kv_shared[elem + 2] = ty;
+                kv_shared[elem + 3] = tz;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Accumulate softmax-weighted V ────────────────────────────────
+        acc_v += es * kv_shared[elem];
+    }
+
+    // Write partial output (unnormalized) + per-tile log-sum-exp metadata.
+    uint out_base = (tile_idx * n_heads + head_idx) * dim;
+    partial_o[out_base + elem] = acc_v;
+
+    if (elem == 0) {
+        uint meta_idx = tile_idx * n_heads + head_idx;
+        tile_max[meta_idx] = s_max[0];
+        tile_sum_exp[meta_idx] = s_sum[0];
+    }
+"""
+
+
+_iso_flash_decode_kernel = None
+
+
+def iso_flash_decode(
+    query: mx.array,
+    k_packed: mx.array,
+    k_norms: mx.array,
+    v_packed: mx.array,
+    v_norms: mx.array,
+    centroids: mx.array,
+    q_L: mx.array,
+    q_R: Optional[mx.array],
+    scale: float,
+    dim: int,
+    bits: int,
+) -> mx.array:
+    """Fully fused IsoQuant flash decode.
+
+    Each threadgroup processes a `ISO_TILE_SIZE`-token tile for one head, doing
+    unpack(K) → inverse-iso-rotate(K) → QK dot → online softmax update →
+    unpack(V) → inverse-iso-rotate(V) → accumulate(es * V) without writing
+    any FP intermediate K/V to device memory. Tiles are merged via log-sum-exp
+    in Python on the way out.
+
+    Args:
+        query: (B, H, 1, D) — current decode-step query.
+        k_packed, k_norms: iso-packed K cache (see iso_compress for layout).
+        v_packed, v_norms: iso-packed V cache.
+        centroids, q_L, q_R, scale, dim, bits: as for `iso_fused_qk_scores`.
+
+    Returns:
+        out (B, H, 1, D) — attention output. Equivalent to a softmax(QK·scale)·V
+        over the full T-length context, but reads packed K/V exactly once.
+    """
+    global _iso_flash_decode_kernel
+    if _iso_flash_decode_kernel is None:
+        _iso_flash_decode_kernel = mx.fast.metal_kernel(
+            name="iso_flash_decode",
+            input_names=[
+                "query", "k_packed", "k_norms", "v_packed", "v_norms",
+                "centroids", "q_L", "q_R", "scale", "dims",
+            ],
+            output_names=["partial_o", "tile_max", "tile_sum_exp"],
+            source=ISO_FLASH_DECODE_KERNEL,
+        )
+
+    B = query.shape[0]
+    H = query.shape[1]
+    seq_len = k_norms.shape[2]
+    p_dim = k_packed.shape[-1]
+    vpw = _VALS_PER_WORD[bits]
+    num_tiles = (seq_len + ISO_TILE_SIZE - 1) // ISO_TILE_SIZE
+    n_bh = B * H
+    assert dim % 4 == 0 and dim <= 1024
+    assert q_L.shape[0] * 4 == dim
+
+    has_qR = 1 if q_R is not None else 0
+    q_R_flat = (q_R if q_R is not None else mx.zeros_like(q_L)).astype(mx.float32).reshape(-1)
+    q_L_flat = q_L.astype(mx.float32).reshape(-1)
+
+    scale_arr = mx.array([scale], dtype=mx.float32)
+    dims_arr = mx.array(
+        [dim, seq_len, n_bh, bits, vpw, p_dim, ISO_TILE_SIZE, has_qR],
+        dtype=mx.uint32,
+    )
+
+    outputs = _iso_flash_decode_kernel(
+        inputs=[
+            query.astype(mx.float32).reshape(n_bh * dim),
+            k_packed.astype(mx.uint32).reshape(n_bh * seq_len * p_dim),
+            k_norms.astype(mx.float32).reshape(n_bh * seq_len),
+            v_packed.astype(mx.uint32).reshape(n_bh * seq_len * p_dim),
+            v_norms.astype(mx.float32).reshape(n_bh * seq_len),
+            centroids, q_L_flat, q_R_flat, scale_arr, dims_arr,
+        ],
+        template=[("T", mx.float32)],
+        grid=(num_tiles * dim, n_bh, 1),
+        threadgroup=(dim, 1, 1),
+        output_shapes=[
+            (num_tiles * n_bh * dim,),
+            (num_tiles * n_bh,),
+            (num_tiles * n_bh,),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+
+    partial_o = outputs[0].reshape(num_tiles, n_bh, dim)
+    t_max = outputs[1].reshape(num_tiles, n_bh, 1)
+    t_sum_exp = outputs[2].reshape(num_tiles, n_bh, 1)
+
+    # Exact log-sum-exp merge across tiles.
+    global_max = mx.max(t_max, axis=0, keepdims=True)
+    corrections = mx.exp(t_max - global_max)
+    numerator = mx.sum(partial_o * corrections, axis=0)
+    denominator = mx.sum(t_sum_exp * corrections, axis=0)
+    result = numerator / (denominator + 1e-8)
+
+    return result.reshape(B, H, 1, dim)
 
 
 def iso_unrotate_metal(x: mx.array, q_L: mx.array, q_R: Optional[mx.array] = None) -> mx.array:
