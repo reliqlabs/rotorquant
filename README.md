@@ -273,12 +273,28 @@ Metal kernel landed, Modal calibration scaffolded.
 
 ```bash
 pip install -e .
-pytest tests/test_mlx_fused_iso_attention.py  # 36 tests, ~2 s
+pytest tests/test_mlx_fused_iso_attention.py tests/test_iso_kv_cache.py  # 65 tests, ~2 s
 python tools/validate_iso_on_real_model.py \
     mlx-community/Qwen2.5-0.5B-Instruct-4bit 3
 ```
 
 Expected: ≥ 0.93 average cosine on real K vectors at 3-bit, ~4× compression.
+
+### Flash-decode speedup vs `iso_decompress + mx.fast.scaled_dot_product_attention`
+
+Microbench on Apple Silicon GPU (M-series, `head_dim=128, n_heads=8, bits=3`,
+mode=full, 20 iters):
+
+| T (cached tokens) | flash (ms) | reference (ms) | speedup | KV mem savings |
+|---:|---:|---:|---:|---:|
+| 256    |  0.92 |   1.21 |  1.31× | 4.57× |
+| 1024   |  0.99 |   7.94 |  8.00× | 4.57× |
+| 4096   |  3.73 |  37.35 | 10.01× | 4.57× |
+| 16384  | 11.15 | 148.13 | 13.28× | 4.57× |
+
+Speedup grows with context length because `iso_flash_decode` never writes the
+decompressed K, V to device memory — packed buffers are unpacked + rotated
+inline inside the attention loop. Reproduce with `python tools/bench_iso_flash_decode.py`.
 
 ### Calibration → inference flow
 
