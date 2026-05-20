@@ -247,3 +247,46 @@ def test_iso_metal_full_roundtrip():
     mx.eval(back)
     diff = mx.max(mx.abs(x - back)).item()
     assert diff < 1e-3, f"full-cycle roundtrip diff={diff:.3e}"
+
+
+# ── Fused QK kernel correctness ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("mode", ["full", "fast"])
+@pytest.mark.parametrize("bits", [2, 3, 4])
+def test_iso_fused_qk_matches_reference(mode, bits):
+    """Fused QK score should match `iso_decompress + matmul` within float-32 noise."""
+    import math
+    from turboquant.mlx_fused_iso_attention import (
+        iso_compress, iso_decompress, iso_fused_qk_scores,
+        make_random_quaternions, _ISO_CODEBOOKS,
+    )
+    mx.random.seed(0)
+    B, H, T, D = 1, 2, 50, 128
+    n_groups = D // 4
+    q_L = make_random_quaternions(n_groups, seed=7)
+    q_R = make_random_quaternions(n_groups, seed=8) if mode == "full" else None
+    centroids = _ISO_CODEBOOKS[bits]
+
+    # Build a synthetic K cache.
+    K = mx.random.normal((B * H * T, D)).astype(mx.float32)
+    k_packed_flat, k_norms_flat = iso_compress(K, bits, q_L, q_R, centroids)
+    k_packed = k_packed_flat.reshape(B, H, T, -1)
+    k_norms = k_norms_flat.reshape(B, H, T)
+
+    # Reference: decompress, then matmul against Q.
+    K_dec = iso_decompress(k_packed_flat, k_norms_flat, D, bits, q_L, q_R, centroids)
+    K_dec = K_dec.reshape(B, H, T, D)
+    q = mx.random.normal((B, H, 1, D)).astype(mx.float32)
+    scale = 1.0 / math.sqrt(D)
+    ref = (q @ K_dec.swapaxes(-1, -2)) * scale
+
+    # Fused kernel.
+    fused = iso_fused_qk_scores(
+        q, k_packed, k_norms, centroids, q_L, q_R, scale, D, bits,
+    )
+    mx.eval(ref, fused)
+    diff = mx.max(mx.abs(ref - fused)).item()
+    # Loose tolerance because the kernel runs everything in float32 (matching
+    # ref) but rounds via shared-mem load/stores.
+    assert diff < 5e-4, f"fused vs ref diff={diff:.3e}  (mode={mode}, bits={bits})"

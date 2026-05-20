@@ -306,6 +306,176 @@ ISO_INVERSE_ROTATE_KERNEL = """
 _iso_inverse_rotate_kernel = None
 
 
+ISO_FUSED_QK_KERNEL = """
+    uint seq_idx = threadgroup_position_in_grid.x;
+    uint head_idx = threadgroup_position_in_grid.y;
+    uint elem = thread_position_in_threadgroup.x;
+    uint dim = dims[0];
+    uint seq_len = dims[1];
+    uint n_heads = dims[2];
+    uint bits = dims[3];
+    uint vals_per_word = dims[4];
+    uint packed_dim = dims[5];
+    uint has_qR = dims[6];
+    uint bit_mask = (1u << bits) - 1u;
+
+    // Load Q into shared memory.
+    threadgroup float q_shared[1024];
+    q_shared[elem] = (float)query[head_idx * dim + elem];
+
+    // Unpack K element from packed uint32.
+    uint word_idx = elem / vals_per_word;
+    uint pos_in_word = elem % vals_per_word;
+    uint word = packed[(head_idx * seq_len + seq_idx) * packed_dim + word_idx];
+    uint idx = (word >> (pos_in_word * bits)) & bit_mask;
+
+    // Codebook lookup × per-token norm.
+    float val = centroids[idx] * norms[head_idx * seq_len + seq_idx];
+
+    threadgroup float k_shared[1024];
+    k_shared[elem] = val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Inverse quaternion sandwich: one thread per 4-group.
+    if (elem % 4 == 0) {
+        uint group_idx = elem / 4;
+        uint qbase = group_idx * 4;
+
+        float v0 = k_shared[elem];
+        float v1 = k_shared[elem + 1];
+        float v2 = k_shared[elem + 2];
+        float v3 = k_shared[elem + 3];
+
+        float qlw =  q_L[qbase + 0];
+        float qlx = -q_L[qbase + 1];
+        float qly = -q_L[qbase + 2];
+        float qlz = -q_L[qbase + 3];
+
+        float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
+        float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
+        float ty = qlw * v2 - qlx * v3 + qly * v0 + qlz * v1;
+        float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
+
+        if (has_qR == 1u) {
+            float qrw = q_R[qbase + 0];
+            float qrx = q_R[qbase + 1];
+            float qry = q_R[qbase + 2];
+            float qrz = q_R[qbase + 3];
+            k_shared[elem]     = tw * qrw - tx * qrx - ty * qry - tz * qrz;
+            k_shared[elem + 1] = tw * qrx + tx * qrw + ty * qrz - tz * qry;
+            k_shared[elem + 2] = tw * qry - tx * qrz + ty * qrw + tz * qrx;
+            k_shared[elem + 3] = tw * qrz + tx * qry - ty * qrx + tz * qrw;
+        } else {
+            k_shared[elem]     = tw;
+            k_shared[elem + 1] = tx;
+            k_shared[elem + 2] = ty;
+            k_shared[elem + 3] = tz;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Dot product Q · K_inv-rotated.
+    float dot = q_shared[elem] * k_shared[elem];
+    threadgroup float dot_shared[1024];
+    dot_shared[elem] = dot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction.
+    for (uint stride = dim / 2; stride > 0; stride >>= 1) {
+        if (elem < stride) {
+            dot_shared[elem] += dot_shared[elem + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (elem == 0) {
+        out[head_idx * seq_len + seq_idx] = (T)(dot_shared[0] * scale[0]);
+    }
+"""
+
+
+_iso_fused_qk_kernel = None
+
+
+def iso_fused_qk_scores(
+    query: mx.array,
+    k_packed: mx.array,
+    k_norms: mx.array,
+    centroids: mx.array,
+    q_L: mx.array,
+    q_R: Optional[mx.array],
+    scale: float,
+    dim: int,
+    bits: int,
+) -> mx.array:
+    """One-pass QK score: unpack K → inverse iso-rotate → dot with Q → scale.
+
+    Mirrors `planar_fused_qk_scores` in mlx_fused_planar_attention.py, but
+    uses the 4D quaternion sandwich rotation instead of the 2D Givens. Same
+    packed format and per-token norm convention so existing K cache buffers
+    are reusable.
+
+    Args:
+        query: (B, H, 1, D) float / half — the query for the current decode step.
+        k_packed: (B, H, T, packed_dim) uint32 — packed iso-quantized K cache.
+        k_norms:  (B, H, T) float32 — per-token K norm (matches kernel
+            convention `centroid[idx] * norm`).
+        centroids: (n_levels,) float32 — Lloyd-Max codebook for `bits`.
+        q_L: (n_groups, 4) float32 — left quaternion rotor per 4-block.
+        q_R: (n_groups, 4) float32 or None — right rotor (None = SO(3) fast mode).
+        scale: softmax temperature, typically 1/sqrt(D).
+        dim: head_dim (must be divisible by 4 and ≤ 1024).
+        bits: quantization bits (1..4).
+
+    Returns:
+        scores (B, H, 1, T) float32 — QK scaled scores.
+    """
+    global _iso_fused_qk_kernel
+    if _iso_fused_qk_kernel is None:
+        _iso_fused_qk_kernel = mx.fast.metal_kernel(
+            name="iso_fused_qk",
+            input_names=[
+                "query", "packed", "norms", "centroids",
+                "q_L", "q_R", "scale", "dims",
+            ],
+            output_names=["out"],
+            source=ISO_FUSED_QK_KERNEL,
+        )
+
+    B = query.shape[0]
+    H = query.shape[1]
+    seq_len = k_norms.shape[2]
+    p_dim = k_packed.shape[-1]
+    vpw = _VALS_PER_WORD[bits]
+    assert dim % 4 == 0 and dim <= 1024, f"dim={dim} unsupported"
+    assert q_L.shape[0] * 4 == dim, f"q_L groups must = dim/4"
+
+    has_qR = 1 if q_R is not None else 0
+    q_R_flat = (q_R if q_R is not None else mx.zeros_like(q_L)).astype(mx.float32).reshape(-1)
+    q_L_flat = q_L.astype(mx.float32).reshape(-1)
+
+    scale_arr = mx.array([scale], dtype=mx.float32)
+    dims_arr = mx.array(
+        [dim, seq_len, B * H, bits, vpw, p_dim, has_qR],
+        dtype=mx.uint32,
+    )
+
+    outputs = _iso_fused_qk_kernel(
+        inputs=[
+            query.astype(mx.float32).reshape(B * H * dim),
+            k_packed.astype(mx.uint32).reshape(B * H * seq_len * p_dim),
+            k_norms.astype(mx.float32).reshape(B * H * seq_len),
+            centroids, q_L_flat, q_R_flat, scale_arr, dims_arr,
+        ],
+        template=[("T", mx.float32)],
+        grid=(seq_len * dim, B * H, 1),
+        threadgroup=(dim, 1, 1),
+        output_shapes=[(B * H * seq_len,)],
+        output_dtypes=[mx.float32],
+    )
+    return outputs[0].reshape(B, H, 1, seq_len)
+
+
 def iso_unrotate_metal(x: mx.array, q_L: mx.array, q_R: Optional[mx.array] = None) -> mx.array:
     """Metal-fused inverse IsoQuant rotation. Equivalent to `iso_unrotate` but
     runs a single Metal threadgroup per row.
