@@ -61,19 +61,46 @@ _CALIB_PROMPTS = [
     "import Mathlib.Data.List.Basic\n\ntheorem length_append (xs ys : List α) : (xs ++ ys).length = xs.length + ys.length := by\n  induction xs with\n  | nil => simp\n  | cons x xs ih => simp [List.cons_append, List.length_cons, ih, Nat.succ_add]",
     "import Mathlib.Topology.Basic\n\nexample {X Y : Type*} [TopologicalSpace X] [TopologicalSpace Y]\n    (f : X → Y) (hf : Continuous f) (U : Set Y) (hU : IsOpen U) :\n    IsOpen (f ⁻¹' U) := hf.isOpen_preimage U hU",
     "import Mathlib.Analysis.Calculus.Deriv.Basic\n\nexample : deriv (fun x => x^2) = (fun x => 2*x) := by\n  ext x\n  simp [deriv_pow]",
+    "theorem and_comm (p q : Prop) : p ∧ q ↔ q ∧ p := by\n  constructor\n  · rintro ⟨hp, hq⟩; exact ⟨hq, hp⟩\n  · rintro ⟨hq, hp⟩; exact ⟨hp, hq⟩",
+    "theorem not_not_iff (p : Prop) [Decidable p] : ¬¬p ↔ p := by\n  constructor\n  · intro hnn; by_contra hp; exact hnn hp\n  · intro hp hnp; exact hnp hp",
+    "import Mathlib.Algebra.Group.Defs\n\nexample {G : Type*} [Group G] (a : G) : a * a⁻¹ = 1 := mul_inv_cancel a\n\nexample {G : Type*} [Group G] (a b : G) : (a * b)⁻¹ = b⁻¹ * a⁻¹ := by\n  rw [mul_inv_rev]",
+    "import Mathlib.Algebra.Ring.Basic\n\nexample {R : Type*} [Ring R] (a b : R) : a * 0 = 0 := mul_zero a\nexample {R : Type*} [Ring R] (a b c : R) : a * (b + c) = a * b + a * c := mul_add a b c",
+    "import Mathlib.Data.Real.Basic\n\nexample (x : ℝ) (hx : 0 < x) : 1 / x > 0 := by positivity\nexample (a b : ℝ) (h : a < b) : a + 1 < b + 1 := by linarith",
+    "import Mathlib.Tactic.Ring\n\nexample (a b : ℝ) : (a + b)^2 = a^2 + 2*a*b + b^2 := by ring\nexample (x y : ℝ) : (x - y) * (x + y) = x^2 - y^2 := by ring",
+    "import Mathlib.Combinatorics.Choose.Basic\n\nexample : Nat.choose 5 2 = 10 := by decide\nexample (n : Nat) : Nat.choose n 0 = 1 := Nat.choose_zero_right n",
     # Math prose for distributional coverage.
     "Solve the integral ∫ sin(x) cos(x) dx using the substitution u = sin(x), du = cos(x) dx, giving ∫ u du = u²/2 + C = sin²(x)/2 + C.",
     "The ε-δ definition of a limit states that limₓ→a f(x) = L iff for every ε > 0 there exists δ > 0 such that |x - a| < δ implies |f(x) - L| < ε. Continuity at a means this limit equals f(a).",
     "Cantor's diagonal argument shows that the set of reals in [0, 1] is uncountable. Assume a bijection f : ℕ → [0, 1] exists; construct a real r whose nth digit differs from f(n)'s nth digit. Then r is not in the image, contradicting surjectivity.",
     "The cardinality of the continuum c = 2^ℵ₀. The continuum hypothesis asks whether ℵ₁ = c; it is independent of ZFC.",
+    "By Lagrange's theorem, the order of any subgroup H of a finite group G divides |G|. Cosets of H partition G into equal-size blocks, and the number of blocks is [G : H] = |G| / |H|.",
+    "Gauss-Bonnet: for a compact oriented Riemannian 2-manifold M, ∫_M K dA + ∫_∂M κ_g ds = 2π χ(M), where K is the Gaussian curvature, κ_g the geodesic curvature of the boundary, and χ(M) the Euler characteristic. Topology constrains total curvature.",
+    "The fundamental theorem of arithmetic says every integer n > 1 admits a unique factorization n = p₁^a₁ … p_k^a_k with primes p_i in increasing order. Uniqueness is proved by infinite descent on the smallest counterexample.",
+    "Stokes' theorem unifies the classical theorems of Green, Gauss, and Kelvin: ∫_M dω = ∫_∂M ω, for any smooth k-form ω on an oriented k+1-manifold M with boundary. Differential geometry's deepest one-liner.",
+    "A topological space X is compact iff every open cover has a finite subcover. In ℝⁿ this is equivalent to closed and bounded (Heine-Borel). Compactness implies sequential compactness in metric spaces; the reverse needs second countability.",
+    "Fermat's little theorem: for prime p and integer a not divisible by p, a^(p-1) ≡ 1 (mod p). Equivalently a^p ≡ a (mod p) without the coprimality assumption. Proves quickly by induction on a using the binomial theorem mod p.",
     # Code / general English.
     "def fibonacci(n: int) -> int:\n    if n < 2:\n        return n\n    a, b = 0, 1\n    for _ in range(n - 1):\n        a, b = b, a + b\n    return b",
     "Merge sort recursively splits an array of length n into halves, sorts each, then merges in O(n) time. Total complexity T(n) = 2 T(n/2) + Θ(n) = Θ(n log n). Stable and not in-place by default.",
     "A category C consists of objects and morphisms (arrows) between them, with composition and identities satisfying associativity and unit laws. A functor F : C → D maps objects to objects and morphisms to morphisms preserving composition: F(g ∘ f) = F(g) ∘ F(f).",
+    "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[len(arr)//2]\n    left = [x for x in arr if x < pivot]\n    mid = [x for x in arr if x == pivot]\n    right = [x for x in arr if x > pivot]\n    return quicksort(left) + mid + quicksort(right)",
+    "// Rust: a simple LRU cache with O(1) get/put.\nstruct LRU<K, V> { map: HashMap<K, V>, order: VecDeque<K>, cap: usize }\nimpl<K: Hash + Eq + Clone, V> LRU<K, V> {\n    fn get(&mut self, k: &K) -> Option<&V> { /* move to front, return ref */ }\n    fn put(&mut self, k: K, v: V) { /* evict last if at cap */ }\n}",
+    "Transformers use scaled-dot-product attention: softmax(QK^T / √d) V. Multi-head splits Q, K, V into h heads, runs attention in parallel, concatenates outputs. The √d scale prevents softmax saturation at high d.",
+    "Cache-oblivious algorithms achieve asymptotically optimal cache behavior without knowing the cache size. Recursive divide-and-conquer eventually fits in any cache level. Classic examples: matrix transpose, FFT, sorting.",
+    "Floyd-Warshall computes all-pairs shortest paths in O(V^3) for a weighted directed graph. The kth iteration relaxes paths going through vertices 1..k. Handles negative edges (but not negative cycles).",
     # More dense math text to extend the corpus.
     "The Riemann zeta function ζ(s) = Σ_{n=1}^∞ 1/n^s converges for Re(s) > 1 and has analytic continuation to ℂ \\ {1}. Its non-trivial zeros all lie on Re(s) = 1/2 by the Riemann hypothesis.",
     "In linear algebra, the singular value decomposition factorizes any m×n matrix A as U Σ V^T where U and V are orthogonal and Σ is diagonal with non-negative singular values. Used for PCA, low-rank approximation, and pseudo-inverses.",
     "Bayes' theorem: P(A|B) = P(B|A) P(A) / P(B). Updates belief in A given new evidence B. Foundation of Bayesian inference and used throughout statistics, machine learning, and decision theory.",
+    "Information theory bounds: Shannon's source coding theorem H(X) ≤ L < H(X) + 1 for prefix codes; channel capacity C = max_{p(x)} I(X;Y). Mutual information I(X;Y) = H(X) - H(X|Y) = H(Y) - H(Y|X).",
+    "Convex optimization: a problem min f(x) subject to g_i(x) ≤ 0, h_j(x) = 0 is convex iff f and g_i are convex and h_j are affine. Strong duality holds under Slater's condition; KKT conditions characterize optima.",
+    "Markov chains on a finite state space converge to a stationary distribution π satisfying π = πP, provided the chain is irreducible and aperiodic. Mixing time bounds via spectral gap or coupling arguments.",
+    "Galois theory connects field extensions to group theory: for a finite Galois extension L/K, intermediate fields correspond bijectively to subgroups of Gal(L/K). A polynomial is solvable by radicals iff its Galois group is solvable.",
+    "The Cauchy-Schwarz inequality: |⟨u, v⟩| ≤ ‖u‖ ‖v‖ in any inner product space, with equality iff u and v are linearly dependent. Proof by considering ‖u - t v‖² ≥ 0 and minimizing over t.",
+    "Differential equations: linear ODEs y' + p(x) y = q(x) solve via integrating factor μ = exp(∫p). Separable ODEs y' = f(x)g(y) integrate after dy/g(y) = f(x) dx. Nonlinear cases often need numerical methods like Runge-Kutta-4.",
+    "Probability concentration: Markov P(X ≥ a) ≤ E[X]/a; Chebyshev P(|X - μ| ≥ k σ) ≤ 1/k²; Chernoff bounds give exponential tails for sums of independent bounded random variables. Foundation of randomized algorithm analysis.",
+    "The Banach fixed-point theorem: a contraction T : X → X on a non-empty complete metric space has a unique fixed point. Used to prove existence/uniqueness in ODEs (Picard-Lindelöf), Newton's method convergence, and integral equations.",
+    "Spectral theorem for self-adjoint operators on Hilbert spaces: a bounded self-adjoint operator T has a real spectrum and is unitarily equivalent to multiplication by a real-valued function. Foundation of quantum mechanics.",
 ]
 
 
@@ -93,6 +120,7 @@ def calibrate(
     optimize: str = "random",
     grad_steps: int = 300,
     grad_lr: float = 1e-2,
+    per_head: bool = False,
 ):
     """Capture K activations + search for low-error rotor seeds per layer.
 
@@ -122,7 +150,8 @@ def calibrate(
     from turboquant.isoquant import IsoQuantMSE, make_random_unit_quaternion
 
     print(f"[calib] bits={bits} mode={mode} seeds={n_rotor_seeds} "
-          f"calib_tokens={calib_tokens}", flush=True)
+          f"calib_tokens={calib_tokens} per_head={per_head} optimize={optimize}",
+          flush=True)
 
     prepare_hf_intermediate_if_missing()
 
@@ -202,7 +231,10 @@ def calibrate(
 
     # past_kv may be a DynamicCache or a list-of-tuples depending on transformers
     # version. Normalize to a list of K tensors per layer.
+    # When per_head=False (legacy), we flatten heads into rows: (N, head_dim).
+    # When per_head=True, we keep heads separate: (n_heads, N_per_head, head_dim).
     captured: dict[int, torch.Tensor] = {}
+    n_kv_heads_observed = None
     for li in layer_ids:
         K = _extract_k_for_layer(past_kv, li)
         if K is None:
@@ -210,51 +242,89 @@ def calibrate(
                   flush=True)
             continue
         # K shape: (B, n_kv_heads, seq, head_dim)
-        captured[li] = K.detach().reshape(-1, K.shape[-1]).to(torch.float32).cpu()
-        print(f"[calib]   layer {li}: K {tuple(K.shape)} -> {captured[li].shape[0]} vectors",
-              flush=True)
+        K_t = K.detach().to(torch.float32).cpu()
+        n_kv_heads_observed = K_t.shape[1]
+        if per_head:
+            # (B, H, T, D) -> (H, B*T, D); each head's K samples stay isolated.
+            K_perm = K_t.permute(1, 0, 2, 3).reshape(K_t.shape[1], -1, K_t.shape[-1])
+            captured[li] = K_perm
+            print(f"[calib]   layer {li}: K {tuple(K.shape)} -> "
+                  f"per-head shape {tuple(K_perm.shape)}", flush=True)
+        else:
+            captured[li] = K_t.reshape(-1, K_t.shape[-1])
+            print(f"[calib]   layer {li}: K {tuple(K.shape)} -> "
+                  f"{captured[li].shape[0]} vectors (flattened)", flush=True)
 
-    # Per layer: run random-rotor search, save best q_L (+q_R).
+    # Per layer (× per head if requested): random-rotor search → save rotors.
     out_dir = f"{ROTORQUANT_CALIB_PATH}/iso/{output_tag}/bits{bits}-{mode}"
     os.makedirs(out_dir, exist_ok=True)
     summary: dict[str, dict] = {}
     rotor_state: dict[str, torch.Tensor] = {}
-    # If gradient-refining, do it on GPU (K is on cpu after the model forward
-    # but moving back to cuda is cheap — 31k vectors × 128 fp32 = ~16 MB).
     grad_device = None
     if optimize == "gradient":
         import torch
         grad_device = (torch.device("cuda")
                        if torch.cuda.is_available() else torch.device("cpu"))
 
-    for li in layer_ids:
-        if li not in captured:
-            continue
-        K = captured[li]  # already (N, head_dim) fp32 on cpu
-        best = _random_rotor_search(K, head_dim, bits, mode, n_rotor_seeds)
+    def _run_one(K_block, label: str) -> dict:
+        """Random search (+ optional gradient refine) on a single K block."""
+        best = _random_rotor_search(K_block, head_dim, bits, mode, n_rotor_seeds)
         if optimize == "gradient":
-            K_gpu = K.to(grad_device)
+            K_gpu = K_block.to(grad_device)
             refined = _gradient_refine_rotors(
                 K_gpu, head_dim, bits, mode, init=best,
                 n_steps=grad_steps, lr=grad_lr,
             )
             if refined["cos_mean"] >= best["cos_mean"]:
+                lift = refined["cos_mean"] - best["cos_mean"]
                 best = refined
-                print(f"[calib]   layer {li}: gradient refine lift "
-                      f"{best['cos_mean'] - refined['cos_mean']:+.4f} (kept)", flush=True)
-        rotor_state[f"layer_{li}.q_L"] = best["q_L"]
-        if mode == "full":
-            rotor_state[f"layer_{li}.q_R"] = best["q_R"]
-        summary[f"layer_{li}"] = {
-            "seed": best["seed"],
-            "cosine_mean": best["cos_mean"],
-            "cosine_p05": best["cos_p05"],
-            "mse": best["mse"],
-            "n_vectors": K.shape[0],
-        }
-        print(f"[calib] layer {li}: seed={best['seed']:>5} "
-              f"cos={best['cos_mean']:.4f} (p5={best['cos_p05']:.4f}) "
-              f"mse={best['mse']:.4e}", flush=True)
+                print(f"[calib]   {label}: gradient refine lift "
+                      f"{lift:+.4f} (kept)", flush=True)
+        return best
+
+    for li in layer_ids:
+        if li not in captured:
+            continue
+        if per_head:
+            K_layer = captured[li]  # (H, N_per_head, head_dim)
+            n_heads = K_layer.shape[0]
+            cos_per_head, p05_per_head = [], []
+            for hi in range(n_heads):
+                K_head = K_layer[hi]
+                best = _run_one(K_head, f"layer {li} head {hi}")
+                rotor_state[f"layer_{li}_head_{hi}.q_L"] = best["q_L"]
+                if mode == "full":
+                    rotor_state[f"layer_{li}_head_{hi}.q_R"] = best["q_R"]
+                cos_per_head.append(best["cos_mean"])
+                p05_per_head.append(best["cos_p05"])
+            summary[f"layer_{li}"] = {
+                "n_heads": n_heads,
+                "cosine_mean_avg": sum(cos_per_head) / n_heads,
+                "cosine_mean_min": min(cos_per_head),
+                "cosine_mean_max": max(cos_per_head),
+                "cosine_p05_avg": sum(p05_per_head) / n_heads,
+                "n_vectors_per_head": K_layer.shape[1],
+            }
+            print(f"[calib] layer {li}: H={n_heads} "
+                  f"cos avg={summary[f'layer_{li}']['cosine_mean_avg']:.4f} "
+                  f"(min={min(cos_per_head):.4f} max={max(cos_per_head):.4f})",
+                  flush=True)
+        else:
+            K = captured[li]
+            best = _run_one(K, f"layer {li}")
+            rotor_state[f"layer_{li}.q_L"] = best["q_L"]
+            if mode == "full":
+                rotor_state[f"layer_{li}.q_R"] = best["q_R"]
+            summary[f"layer_{li}"] = {
+                "seed": best["seed"],
+                "cosine_mean": best["cos_mean"],
+                "cosine_p05": best["cos_p05"],
+                "mse": best["mse"],
+                "n_vectors": K.shape[0],
+            }
+            print(f"[calib] layer {li}: seed={best['seed']:>5} "
+                  f"cos={best['cos_mean']:.4f} (p5={best['cos_p05']:.4f}) "
+                  f"mse={best['mse']:.4e}", flush=True)
 
     rotors_path = f"{out_dir}/rotors.safetensors"
     save_file(rotor_state, rotors_path, metadata={"format": "pt"})
@@ -422,6 +492,7 @@ def main(
     optimize: str = "random",
     grad_steps: int = 300,
     grad_lr: float = 1e-2,
+    per_head: bool = False,
 ):
     result = calibrate.remote(
         bits=bits,
@@ -433,6 +504,7 @@ def main(
         optimize=optimize,
         grad_steps=grad_steps,
         grad_lr=grad_lr,
+        per_head=per_head,
     )
     print("---- calibration summary ----")
     print(json.dumps(result["summary"], indent=2))

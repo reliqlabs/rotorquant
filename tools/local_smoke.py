@@ -58,9 +58,15 @@ DEFAULT_CALIB_TEXT = (
 GENERATION_PROMPT = "The capital of France is"
 
 
-def _capture_k_per_layer(model, tokenizer, calib_text: str, layer_ids: list[int]) -> dict[int, mx.array]:
+def _capture_k_per_layer(model, tokenizer, calib_text: str, layer_ids: list[int],
+                          per_head: bool) -> dict[int, mx.array]:
     """Run one forward with a default prompt cache, return K per requested layer.
-    K shape per layer: (B*H*T, head_dim) as mx.float32, ready for torch."""
+
+    Shape per layer:
+      - per_head=False: (B*H*T, head_dim) — all heads pooled (legacy).
+      - per_head=True:  (H, B*T, head_dim) — heads kept separate so each gets
+        its own rotor.
+    """
     from mlx_lm.models.cache import make_prompt_cache
 
     cache = make_prompt_cache(model)
@@ -80,10 +86,18 @@ def _capture_k_per_layer(model, tokenizer, calib_text: str, layer_ids: list[int]
         K = cache[li].keys  # (B, H, T_padded, head_dim)
         t_actual = cache[li].offset
         K = K[:, :, :t_actual, :].astype(mx.float32)
-        n = K.shape[0] * K.shape[1] * K.shape[2]
-        out[li] = K.reshape(n, K.shape[-1])
-        print(f"[calib]   layer {li}: K (B,H,T,D)={tuple(K.shape)} -> {n} vectors",
-              flush=True)
+        B, H, T, D = K.shape
+        if per_head:
+            # (B, H, T, D) -> (H, B*T, D)
+            K_perm = K.transpose(1, 0, 2, 3).reshape(H, B * T, D)
+            out[li] = K_perm
+            print(f"[calib]   layer {li}: K (B,H,T,D)={tuple(K.shape)} -> "
+                  f"per-head {tuple(K_perm.shape)}", flush=True)
+        else:
+            n = B * H * T
+            out[li] = K.reshape(n, D)
+            print(f"[calib]   layer {li}: K (B,H,T,D)={tuple(K.shape)} -> {n} vectors",
+                  flush=True)
     return out
 
 
@@ -187,41 +201,67 @@ def main() -> int:
     ap.add_argument("--grad-steps", type=int, default=200)
     ap.add_argument("--n-inits", type=int, default=4)
     ap.add_argument("--max-tokens", type=int, default=40)
+    ap.add_argument("--per-head", action="store_true",
+                    help="calibrate one rotor per (layer, kv-head) instead of per layer")
     ap.add_argument("--out", default="calibration_artifacts/local_smoke_rotors.safetensors")
     args = ap.parse_args()
 
     layer_ids = [int(x) for x in args.layers.split(",")]
 
-    print(f"[smoke] loading {args.model}", flush=True)
+    print(f"[smoke] loading {args.model} (per_head={args.per_head})", flush=True)
     from mlx_lm import load
     model, tokenizer = load(args.model)
 
     # ── Stage 1: capture K ─────────────────────────────────────────────────
-    captured = _capture_k_per_layer(model, tokenizer, DEFAULT_CALIB_TEXT, layer_ids)
+    captured = _capture_k_per_layer(model, tokenizer, DEFAULT_CALIB_TEXT,
+                                     layer_ids, per_head=args.per_head)
     if not captured:
         print("[smoke] no K captured — abort", flush=True)
         return 1
     head_dim = next(iter(captured.values())).shape[-1]
     print(f"[smoke] head_dim={head_dim}", flush=True)
 
-    # ── Stage 2: calibrate per-layer ───────────────────────────────────────
+    # ── Stage 2: calibrate ─────────────────────────────────────────────────
     rotor_state: dict[str, "torch.Tensor"] = {}
     cos_random_list: list[float] = []
     cos_refined_list: list[float] = []
     for li, K_mx in captured.items():
         t0 = time.time()
-        r = _calibrate_layer(K_mx, head_dim, args.bits, args.mode,
-                             args.n_seeds, args.grad_steps, args.n_inits)
-        dt = time.time() - t0
-        cos_random_list.append(r["cos_random"])
-        cos_refined_list.append(r["cos_refined"])
-        rotor_state[f"layer_{li}.q_L"] = r["q_L"]
-        if args.mode == "full":
-            rotor_state[f"layer_{li}.q_R"] = r["q_R"]
-        lift = r["cos_refined"] - r["cos_random"]
-        print(f"[calib] layer {li}: cos_random={r['cos_random']:.4f} "
-              f"-> cos_refined={r['cos_refined']:.4f} "
-              f"(lift {lift:+.4f}, {dt:.1f}s)", flush=True)
+        if args.per_head:
+            # K_mx shape: (H, N_per_head, D). Loop over heads.
+            n_heads = K_mx.shape[0]
+            head_cos_rand, head_cos_ref = [], []
+            for hi in range(n_heads):
+                r = _calibrate_layer(K_mx[hi], head_dim, args.bits, args.mode,
+                                     args.n_seeds, args.grad_steps, args.n_inits)
+                rotor_state[f"layer_{li}_head_{hi}.q_L"] = r["q_L"]
+                if args.mode == "full":
+                    rotor_state[f"layer_{li}_head_{hi}.q_R"] = r["q_R"]
+                head_cos_rand.append(r["cos_random"])
+                head_cos_ref.append(r["cos_refined"])
+            dt = time.time() - t0
+            avg_rand_l = sum(head_cos_rand) / n_heads
+            avg_ref_l = sum(head_cos_ref) / n_heads
+            cos_random_list.append(avg_rand_l)
+            cos_refined_list.append(avg_ref_l)
+            print(f"[calib] layer {li} (H={n_heads}): "
+                  f"avg cos_random={avg_rand_l:.4f} -> "
+                  f"avg cos_refined={avg_ref_l:.4f} "
+                  f"(min={min(head_cos_ref):.4f} max={max(head_cos_ref):.4f}, {dt:.1f}s)",
+                  flush=True)
+        else:
+            r = _calibrate_layer(K_mx, head_dim, args.bits, args.mode,
+                                 args.n_seeds, args.grad_steps, args.n_inits)
+            dt = time.time() - t0
+            cos_random_list.append(r["cos_random"])
+            cos_refined_list.append(r["cos_refined"])
+            rotor_state[f"layer_{li}.q_L"] = r["q_L"]
+            if args.mode == "full":
+                rotor_state[f"layer_{li}.q_R"] = r["q_R"]
+            lift = r["cos_refined"] - r["cos_random"]
+            print(f"[calib] layer {li}: cos_random={r['cos_random']:.4f} "
+                  f"-> cos_refined={r['cos_refined']:.4f} "
+                  f"(lift {lift:+.4f}, {dt:.1f}s)", flush=True)
 
     avg_random = sum(cos_random_list) / len(cos_random_list)
     avg_refined = sum(cos_refined_list) / len(cos_refined_list)

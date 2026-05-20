@@ -74,15 +74,24 @@ def iso_rotate(x: mx.array, q_L: mx.array, q_R: Optional[mx.array] = None) -> mx
 
     Args:
         x: (..., d), d must be divisible by 4
-        q_L: (n_groups, 4) unit quaternion per 4D block, n_groups == d / 4
-        q_R: optional (n_groups, 4); if given, applies the full SO(4) sandwich
-             T(v) = q_L * v * conj(q_R). If None, applies fast mode T(v) = q_L * v.
+        q_L: (n_groups, 4) for a single rotor broadcast across leading dims, OR
+             (H, n_groups, 4) for per-head rotors — in which case x must have
+             shape (..., H, d) so the head axis at -2 aligns with q_L's first
+             axis under MLX broadcasting.
+        q_R: optional, same shape as q_L. None => SO(3) fast mode T(v) = q_L * v.
 
     Returns:
         (..., d) rotated tensor.
     """
     d = x.shape[-1]
-    n_groups = q_L.shape[0]
+    if q_L.ndim == 2:
+        n_groups = q_L.shape[0]
+    else:
+        n_groups = q_L.shape[1]
+        assert x.shape[-2] == q_L.shape[0], (
+            f"per-head iso_rotate: x must have heads at axis -2 matching "
+            f"q_L.shape[0]={q_L.shape[0]}, got x.shape={x.shape}"
+        )
     assert d == n_groups * 4, f"d={d} must equal n_groups*4 ({n_groups * 4})"
 
     blocks = x.reshape(*x.shape[:-1], n_groups, 4)
@@ -96,13 +105,17 @@ def iso_rotate(x: mx.array, q_L: mx.array, q_R: Optional[mx.array] = None) -> mx
 def iso_unrotate(x: mx.array, q_L: mx.array, q_R: Optional[mx.array] = None) -> mx.array:
     """
     Apply inverse IsoQuant rotation: T^{-1}(v) = conj(q_L) * v * q_R (full)
-    or T^{-1}(v) = conj(q_L) * v (fast).
-
-    This is the rotation that the CUDA fix on 2026-04-01 introduced — V dequant
-    MUST use this inverse path, otherwise PPL explodes (15369 vs 7.05).
+    or T^{-1}(v) = conj(q_L) * v (fast). Same broadcasting rules as iso_rotate.
     """
     d = x.shape[-1]
-    n_groups = q_L.shape[0]
+    if q_L.ndim == 2:
+        n_groups = q_L.shape[0]
+    else:
+        n_groups = q_L.shape[1]
+        assert x.shape[-2] == q_L.shape[0], (
+            f"per-head iso_unrotate: x must have heads at axis -2 matching "
+            f"q_L.shape[0]={q_L.shape[0]}, got x.shape={x.shape}"
+        )
     assert d == n_groups * 4
 
     blocks = x.reshape(*x.shape[:-1], n_groups, 4)
@@ -141,6 +154,45 @@ _ISO_CODEBOOKS = compute_codebooks(_DEFAULT_D)
 # ── Packing helpers (shared with PlanarQuant) ────────────────────────────────
 
 _VALS_PER_WORD = {1: 32, 2: 16, 3: 10, 4: 8}
+
+
+def _prepare_rotors_for_kernel(
+    q_L: mx.array, q_R: Optional[mx.array], dim: int
+) -> Tuple[mx.array, mx.array, int]:
+    """Normalize q_L / q_R into a flat buffer + n_heads_real for kernel use.
+
+    Accepts either:
+      - 2D q_L of shape (n_groups, 4): legacy per-layer rotor, broadcast across
+        every head by the kernel. Returns n_heads_real=1.
+      - 3D q_L of shape (n_heads, n_groups, 4): per-head rotors. Returns
+        n_heads_real = q_L.shape[0]; kernel indexes by head.
+
+    Always returns q_R as a float32 buffer of the same shape as q_L (zeros
+    when q_R is None — the kernel ignores it via has_qR=0). This lets the
+    kernel signature be uniform.
+    """
+    if q_L.ndim == 2:
+        n_heads_real = 1
+        assert q_L.shape[0] * 4 == dim, (
+            f"q_L shape {tuple(q_L.shape)} incompatible with dim={dim}"
+        )
+    elif q_L.ndim == 3:
+        n_heads_real = q_L.shape[0]
+        assert q_L.shape[1] * 4 == dim, (
+            f"q_L per-head shape {tuple(q_L.shape)} incompatible with dim={dim}"
+        )
+    else:
+        raise ValueError(f"q_L must be 2D or 3D, got ndim={q_L.ndim}")
+
+    q_L_flat = q_L.astype(mx.float32).reshape(-1)
+    if q_R is not None:
+        assert q_R.shape == q_L.shape, (
+            f"q_L shape {tuple(q_L.shape)} != q_R shape {tuple(q_R.shape)}"
+        )
+        q_R_flat = q_R.astype(mx.float32).reshape(-1)
+    else:
+        q_R_flat = mx.zeros_like(q_L_flat)
+    return q_L_flat, q_R_flat, n_heads_real
 
 
 def _pack(indices: mx.array, bits: int) -> mx.array:
@@ -250,6 +302,10 @@ ISO_INVERSE_ROTATE_KERNEL = """
     uint d = dims[0];
     uint n_groups = dims[1];
     uint has_qR = dims[2];
+    uint n_heads_real = dims[3];     // 1 = broadcast across heads (legacy)
+    uint rows_per_head = dims[4];    // ignored when n_heads_real == 1
+    uint head_in_layer = (n_heads_real <= 1u) ? 0u
+                        : ((row / rows_per_head) % n_heads_real);
 
     // Stage row into shared memory so threads in a 4-group can read peers.
     threadgroup float v_shared[1024];
@@ -259,7 +315,7 @@ ISO_INVERSE_ROTATE_KERNEL = """
     // Each 4-block is handled by the thread whose elem index is its starting position.
     if (elem % 4 == 0) {
         uint group_idx = elem / 4;
-        uint qbase = group_idx * 4;
+        uint qbase = head_in_layer * d + group_idx * 4;
 
         float v0 = v_shared[elem];
         float v1 = v_shared[elem + 1];
@@ -317,7 +373,9 @@ ISO_FUSED_QK_KERNEL = """
     uint vals_per_word = dims[4];
     uint packed_dim = dims[5];
     uint has_qR = dims[6];
+    uint n_heads_real = dims[7];   // 1 = broadcast (legacy); else H
     uint bit_mask = (1u << bits) - 1u;
+    uint head_in_layer = head_idx % n_heads_real;
 
     // Load Q into shared memory.
     threadgroup float q_shared[1024];
@@ -339,7 +397,7 @@ ISO_FUSED_QK_KERNEL = """
     // Inverse quaternion sandwich: one thread per 4-group.
     if (elem % 4 == 0) {
         uint group_idx = elem / 4;
-        uint qbase = group_idx * 4;
+        uint qbase = head_in_layer * dim + group_idx * 4;
 
         float v0 = k_shared[elem];
         float v1 = k_shared[elem + 1];
@@ -407,7 +465,9 @@ ISO_FUSED_SV_KERNEL = """
     uint vals_per_word = dims[4];
     uint packed_dim = dims[5];
     uint has_qR = dims[6];
+    uint n_heads_real = dims[7];
     uint bit_mask = (1u << bits) - 1u;
+    uint head_in_layer = head_idx % n_heads_real;
 
     float acc = 0.0f;
     threadgroup float v_shared[1024];
@@ -426,7 +486,7 @@ ISO_FUSED_SV_KERNEL = """
         // Inverse quaternion sandwich on each 4-group (per-token).
         if (elem % 4 == 0) {
             uint group_idx = elem / 4;
-            uint qbase = group_idx * 4;
+            uint qbase = head_in_layer * dim + group_idx * 4;
 
             float v0 = v_shared[elem];
             float v1 = v_shared[elem + 1];
@@ -516,13 +576,11 @@ def iso_fused_sv_values(
     p_dim = v_packed.shape[-1]
     vpw = _VALS_PER_WORD[bits]
     assert dim % 4 == 0 and dim <= 1024
-    assert q_L.shape[0] * 4 == dim
 
     has_qR = 1 if q_R is not None else 0
-    q_R_flat = (q_R if q_R is not None else mx.zeros_like(q_L)).astype(mx.float32).reshape(-1)
-    q_L_flat = q_L.astype(mx.float32).reshape(-1)
+    q_L_flat, q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, dim)
     dims_arr = mx.array(
-        [dim, seq_len, B * H, bits, vpw, p_dim, has_qR],
+        [dim, seq_len, B * H, bits, vpw, p_dim, has_qR, n_heads_real],
         dtype=mx.uint32,
     )
 
@@ -594,15 +652,13 @@ def iso_fused_qk_scores(
     p_dim = k_packed.shape[-1]
     vpw = _VALS_PER_WORD[bits]
     assert dim % 4 == 0 and dim <= 1024, f"dim={dim} unsupported"
-    assert q_L.shape[0] * 4 == dim, f"q_L groups must = dim/4"
 
     has_qR = 1 if q_R is not None else 0
-    q_R_flat = (q_R if q_R is not None else mx.zeros_like(q_L)).astype(mx.float32).reshape(-1)
-    q_L_flat = q_L.astype(mx.float32).reshape(-1)
+    q_L_flat, q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, dim)
 
     scale_arr = mx.array([scale], dtype=mx.float32)
     dims_arr = mx.array(
-        [dim, seq_len, B * H, bits, vpw, p_dim, has_qR],
+        [dim, seq_len, B * H, bits, vpw, p_dim, has_qR, n_heads_real],
         dtype=mx.uint32,
     )
 
@@ -645,7 +701,9 @@ ISO_FLASH_DECODE_KERNEL = """
     uint packed_dim = dims[5];
     uint tile_size = dims[6];
     uint has_qR = dims[7];
+    uint n_heads_real = dims[8];
     uint bit_mask = (1u << bits) - 1u;
+    uint head_in_layer = head_idx % n_heads_real;
 
     uint tile_start = tile_idx * tile_size;
     uint tile_end = tile_start + tile_size;
@@ -684,7 +742,7 @@ ISO_FLASH_DECODE_KERNEL = """
         // ── Inverse quaternion sandwich on K (4-block per thread%4==0) ───
         if (elem % 4 == 0) {
             uint group_idx = elem / 4;
-            uint qbase = group_idx * 4;
+            uint qbase = head_in_layer * dim + group_idx * 4;
 
             float v0 = kv_shared[elem];
             float v1 = kv_shared[elem + 1];
@@ -759,7 +817,7 @@ ISO_FLASH_DECODE_KERNEL = """
         // ── Inverse quaternion sandwich on V ─────────────────────────────
         if (elem % 4 == 0) {
             uint group_idx = elem / 4;
-            uint qbase = group_idx * 4;
+            uint qbase = head_in_layer * dim + group_idx * 4;
 
             float v0 = kv_shared[elem];
             float v1 = kv_shared[elem + 1];
@@ -864,15 +922,13 @@ def iso_flash_decode(
     num_tiles = (seq_len + ISO_TILE_SIZE - 1) // ISO_TILE_SIZE
     n_bh = B * H
     assert dim % 4 == 0 and dim <= 1024
-    assert q_L.shape[0] * 4 == dim
 
     has_qR = 1 if q_R is not None else 0
-    q_R_flat = (q_R if q_R is not None else mx.zeros_like(q_L)).astype(mx.float32).reshape(-1)
-    q_L_flat = q_L.astype(mx.float32).reshape(-1)
+    q_L_flat, q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, dim)
 
     scale_arr = mx.array([scale], dtype=mx.float32)
     dims_arr = mx.array(
-        [dim, seq_len, n_bh, bits, vpw, p_dim, ISO_TILE_SIZE, has_qR],
+        [dim, seq_len, n_bh, bits, vpw, p_dim, ISO_TILE_SIZE, has_qR, n_heads_real],
         dtype=mx.uint32,
     )
 
@@ -946,7 +1002,9 @@ ISO_PHASE1_SCORE_KERNEL = """
     uint packed_dim = dims[5];
     uint tile_size = dims[6];
     uint has_qR = dims[7];
+    uint n_heads_real = dims[8];
     uint bit_mask = (1u << bits) - 1u;
+    uint head_in_layer = head_idx % n_heads_real;
 
     uint tile_start = tile_idx * tile_size;
     uint tile_end = tile_start + tile_size;
@@ -979,7 +1037,7 @@ ISO_PHASE1_SCORE_KERNEL = """
         // ── Inverse iso (quaternion sandwich) on K ───────────────────────
         if (elem % 4 == 0) {
             uint group_idx = elem / 4;
-            uint qbase = group_idx * 4;
+            uint qbase = head_in_layer * dim + group_idx * 4;
 
             float v0 = k_shared[elem];
             float v1 = k_shared[elem + 1];
@@ -1070,7 +1128,9 @@ ISO_PHASE2_SPARSE_ATTEND_KERNEL = """
     uint packed_dim = dims[5];
     uint tile_size = dims[6];
     uint has_qR = dims[7];
+    uint n_heads_real = dims[8];
     uint bit_mask = (1u << bits) - 1u;
+    uint head_in_layer = head_idx % n_heads_real;
 
     uint tile_start = tile_idx * tile_size;
     uint tile_end = tile_start + tile_size;
@@ -1150,7 +1210,7 @@ ISO_PHASE2_SPARSE_ATTEND_KERNEL = """
         // ── Inverse iso on V ────────────────────────────────────────────
         if (elem % 4 == 0) {
             uint group_idx = elem / 4;
-            uint qbase = group_idx * 4;
+            uint qbase = head_in_layer * dim + group_idx * 4;
 
             float v0 = v_shared[elem];
             float v1 = v_shared[elem + 1];
@@ -1265,15 +1325,13 @@ def iso_fused_sparse_attend(
     n_bh = B * H
     top_per_tile = 4
     assert dim % 4 == 0 and dim <= 1024
-    assert q_L.shape[0] * 4 == dim
 
     has_qR = 1 if q_R is not None else 0
-    q_R_flat = (q_R if q_R is not None else mx.zeros_like(q_L)).astype(mx.float32).reshape(-1)
-    q_L_flat = q_L.astype(mx.float32).reshape(-1)
+    q_L_flat, q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, dim)
 
     scale_arr = mx.array([scale], dtype=mx.float32)
     dims_arr = mx.array(
-        [dim, seq_len, n_bh, bits, vpw, p_dim, ISO_TILE_SIZE, has_qR],
+        [dim, seq_len, n_bh, bits, vpw, p_dim, ISO_TILE_SIZE, has_qR, n_heads_real],
         dtype=mx.uint32,
     )
 
@@ -1347,12 +1405,22 @@ def iso_fused_sparse_attend(
     return result.reshape(B, H, 1, dim)
 
 
-def iso_unrotate_metal(x: mx.array, q_L: mx.array, q_R: Optional[mx.array] = None) -> mx.array:
+def iso_unrotate_metal(
+    x: mx.array,
+    q_L: mx.array,
+    q_R: Optional[mx.array] = None,
+    rows_per_head: int = 1,
+) -> mx.array:
     """Metal-fused inverse IsoQuant rotation. Equivalent to `iso_unrotate` but
     runs a single Metal threadgroup per row.
 
-    x: (..., d) — flattens the leading dims into row index for the kernel.
-    q_L: (n_groups, 4); q_R: (n_groups, 4) or None for fast mode.
+    Args:
+        x: (..., d) — flattens the leading dims into row index for the kernel.
+        q_L: (n_groups, 4) for legacy single-rotor mode, or (H, n_groups, 4)
+            for per-head rotors. q_R same shape or None.
+        rows_per_head: ignored when q_L is 2D. When q_L is 3D the kernel uses
+            (row // rows_per_head) % H to pick the rotor for each row, so the
+            caller must lay out x in (..., H, T, d) and pass rows_per_head=T.
     Returns: same shape as `x`.
     """
     global _iso_inverse_rotate_kernel
@@ -1365,7 +1433,7 @@ def iso_unrotate_metal(x: mx.array, q_L: mx.array, q_R: Optional[mx.array] = Non
         )
 
     d = x.shape[-1]
-    n_groups = q_L.shape[0]
+    n_groups = q_L.shape[-2] if q_L.ndim == 3 else q_L.shape[0]
     assert d == n_groups * 4, f"d={d} must equal n_groups*4 ({n_groups * 4})"
     assert d <= 1024, "ISO_INVERSE_ROTATE_KERNEL shared-memory layout assumes d ≤ 1024"
 
@@ -1375,10 +1443,11 @@ def iso_unrotate_metal(x: mx.array, q_L: mx.array, q_R: Optional[mx.array] = Non
         n_rows *= s
 
     x_flat = x.astype(mx.float32).reshape(n_rows, d)
-    q_L_flat = q_L.astype(mx.float32).reshape(-1)  # (n_groups * 4,)
+    q_L_flat, q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, d)
     has_qR = 1 if q_R is not None else 0
-    q_R_flat = (q_R if q_R is not None else mx.zeros_like(q_L)).astype(mx.float32).reshape(-1)
-    dims_arr = mx.array([d, n_groups, has_qR], dtype=mx.uint32)
+    dims_arr = mx.array(
+        [d, n_groups, has_qR, n_heads_real, rows_per_head], dtype=mx.uint32,
+    )
 
     outputs = _iso_inverse_rotate_kernel(
         inputs=[x_flat, q_L_flat, q_R_flat, dims_arr],
