@@ -77,15 +77,29 @@ PROMPTS = [
 # ── Output scoring (cheap regex heuristics — no Lean toolchain required) ───
 
 
+# Strict — "this looks like a real theorem header".
 _THEOREM_RE = re.compile(r"\b(theorem|lemma|example)\s+\w*\s*(?:\([^)]*\)\s*)*:", re.DOTALL)
 _BY_RE = re.compile(r":=\s*by\b")
 _FN_RE = re.compile(r"\b(def|fun)\s+\w+")
 _IMPORTS_RE = re.compile(r"^\s*import\s+\w+", re.MULTILINE)
 _UNICODE_NAT = re.compile(r"\bℕ\b")
 
+# Soft — "does this output show ANY sign of being Lean 4 code at all"?
+# Useful for catching outputs that are valid Lean syntax but not a textbook
+# `theorem name (args) : ... := ...` block. Any of these landing is at least
+# "the model knows the language."
+_LEAN_KEYWORD_RE = re.compile(
+    r"\b(theorem|lemma|example|def|fun|import\s+Mathlib|"
+    r"induction|simp|rfl|exact|intro|apply|cases|constructor|"
+    r"Nat\.|List\.|Prop\b|Type\s*[\d]*\b|⟨|⟩|≤|∀|∃|→|↦)"
+)
+_LEAN_CODEBLOCK_RE = re.compile(r"```\s*lean(?:4)?\b", re.IGNORECASE)
+
 
 def score_output(text: str, expects: dict) -> dict:
-    """Cheap heuristic scoring. Returns a flat dict of booleans + ints."""
+    """Cheap heuristic scoring. Returns a flat dict of booleans + ints + a
+    soft 0-3 partial-credit score so we can distinguish "complete garbage"
+    from "valid Lean but no full theorem" outputs."""
     s = {
         "has_theorem":   bool(_THEOREM_RE.search(text)),
         "has_by":        bool(_BY_RE.search(text)),
@@ -94,11 +108,15 @@ def score_output(text: str, expects: dict) -> dict:
         "unicode_nat":   bool(_UNICODE_NAT.search(text)),
         "char_count":    len(text),
         "ends_with_keyword": text.rstrip().endswith((":= rfl", ":= by", "done", "sorry")),
+        # New soft signals.
+        "has_lean_keyword": bool(_LEAN_KEYWORD_RE.search(text)),
+        "has_lean_codeblock": bool(_LEAN_CODEBLOCK_RE.search(text)),
+        "lean_keyword_count": len(_LEAN_KEYWORD_RE.findall(text)),
     }
-    # Tactic hit if the expected tactic appears anywhere in the body
     if "tactic" in expects:
         s[f"used_{expects['tactic']}"] = bool(re.search(rf"\b{re.escape(expects['tactic'])}\b", text))
-    # Aggregate score: 1 point for theorem/function presence + 1 for `by` if expected
+
+    # Strict score: original 0/2 or 0/3 — exact matches on the textbook form.
     pts = 0
     if expects.get("theorem") and s["has_theorem"]:
         pts += 1
@@ -107,6 +125,16 @@ def score_output(text: str, expects: dict) -> dict:
     if "tactic" in expects and s.get(f"used_{expects['tactic']}", False):
         pts += 1
     s["score"] = pts
+
+    # Soft score: partial credit on a 0-3 scale.
+    soft = 0
+    if s["has_lean_keyword"]:
+        soft += 1
+    if s["has_theorem"] or s["has_function"]:
+        soft += 1
+    if s["has_by"] or s["ends_with_keyword"]:
+        soft += 1
+    s["soft_score"] = soft
     return s
 
 
@@ -119,26 +147,38 @@ def _wrap_inst(user_msg: str) -> str:
     return f"<s>[INST] {user_msg} [/INST]"
 
 
-def generate_mlx_lm(model, tokenizer, user_msg: str, max_tokens: int) -> tuple[str, float]:
-    """Use mlx-lm.generate. Returns (text, wall_seconds)."""
+def generate_mlx_lm(model, tokenizer, user_msg: str, max_tokens: int,
+                    temperature: float = 1.0) -> tuple[str, float]:
+    """Use mlx-lm.generate. Returns (text, wall_seconds).
+
+    Leanstral's README recommends temperature=1.0; we default to that rather
+    than greedy. Greedy on this model produced repetitive/short outputs in
+    our first eval pass.
+    """
     from mlx_lm import generate
-    # Try the tokenizer's chat template first; fall back to manual [INST].
+    from mlx_lm.sample_utils import make_sampler
     try:
         prompt = tokenizer.apply_chat_template(
             [{"role": "user", "content": user_msg}],
             tokenize=False, add_generation_prompt=True,
         )
+        if not prompt or prompt.strip() == user_msg.strip():
+            # apply_chat_template silently returned the raw user message
+            # (tokenizer ships with empty .chat_template attribute). Wrap.
+            prompt = _wrap_inst(user_msg)
     except Exception:
         prompt = _wrap_inst(user_msg)
 
+    sampler = make_sampler(temp=temperature)
     t0 = time.time()
-    text = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
+    text = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens,
+                    verbose=False, sampler=sampler)
     return text, time.time() - t0
 
 
-def generate_mlx_vlm(model, processor, user_msg: str, max_tokens: int) -> tuple[str, float]:
+def generate_mlx_vlm(model, processor, user_msg: str, max_tokens: int,
+                     temperature: float = 1.0) -> tuple[str, float]:
     """Use mlx-vlm.generate. Returns (text, wall_seconds)."""
-    # Same wired_limit workaround as the smoke tests, in case CPU mode is used.
     import contextlib
     import mlx_vlm.generate  # noqa: F401
     _mvgen_mod = sys.modules["mlx_vlm.generate"]
@@ -156,11 +196,14 @@ def generate_mlx_vlm(model, processor, user_msg: str, max_tokens: int) -> tuple[
             [{"role": "user", "content": user_msg}],
             tokenize=False, add_generation_prompt=True,
         )
+        if not prompt or prompt.strip() == user_msg.strip():
+            prompt = _wrap_inst(user_msg)
     except Exception:
         prompt = _wrap_inst(user_msg)
 
     t0 = time.time()
-    result = generate(model, processor, prompt=prompt, max_tokens=max_tokens, verbose=False)
+    result = generate(model, processor, prompt=prompt, max_tokens=max_tokens,
+                      verbose=False, temperature=temperature)
     text = getattr(result, "text", str(result))
     return text, time.time() - t0
 
@@ -176,6 +219,11 @@ def main() -> int:
     ap.add_argument("--n-prompts", type=int, default=len(PROMPTS))
     ap.add_argument("--mlx-vlm", action="store_true",
                     help="use mlx-vlm loader (for Leanstral / Pixtral models)")
+    ap.add_argument("--temperature", type=float, default=1.0,
+                    help="sampling temperature (Leanstral default 1.0; "
+                         "set to 0 for greedy)")
+    ap.add_argument("--print-first", action="store_true",
+                    help="print the first prompt's output verbatim (debug)")
     args = ap.parse_args()
 
     print(f"[eval] loading {args.model} (mlx-vlm={args.mlx_vlm})", flush=True)
@@ -188,8 +236,9 @@ def main() -> int:
 
     out_path = Path(args.out)
     fields = [
-        "name", "score", "char_count", "wall_seconds", "tok_per_sec",
-        "has_theorem", "has_by", "has_function", "imports",
+        "name", "score", "soft_score", "char_count", "wall_seconds", "tok_per_sec",
+        "has_theorem", "has_by", "has_function", "has_lean_keyword",
+        "has_lean_codeblock", "lean_keyword_count", "imports",
         "unicode_nat", "ends_with_keyword", "output",
     ]
     with out_path.open("w", newline="") as f:
@@ -197,24 +246,34 @@ def main() -> int:
         w.writeheader()
         total_score = 0
         max_score = 0
+        total_soft = 0
         for i, p in enumerate(PROMPTS[: args.n_prompts]):
             print(f"[eval] [{i + 1}/{args.n_prompts}] {p['name']}", flush=True)
             try:
                 gen_fn = generate_mlx_vlm if args.mlx_vlm else generate_mlx_lm
-                text, dt = gen_fn(model, processor_or_tok, p["user"], args.max_tokens)
+                text, dt = gen_fn(model, processor_or_tok, p["user"], args.max_tokens,
+                                  temperature=args.temperature)
             except Exception as e:
                 print(f"[eval]   ERROR: {type(e).__name__}: {e}", flush=True)
                 continue
             scores = score_output(text, p["expects"])
+            if args.print_first and i == 0:
+                print(f"[eval]   ---- raw output (first prompt) ----")
+                print(text)
+                print(f"[eval]   ---- end ----", flush=True)
             row = {
                 "name": p["name"],
                 "score": scores["score"],
+                "soft_score": scores["soft_score"],
                 "char_count": scores["char_count"],
                 "wall_seconds": round(dt, 2),
                 "tok_per_sec": round(args.max_tokens / dt, 3),
                 "has_theorem": scores["has_theorem"],
                 "has_by": scores["has_by"],
                 "has_function": scores["has_function"],
+                "has_lean_keyword": scores["has_lean_keyword"],
+                "has_lean_codeblock": scores["has_lean_codeblock"],
+                "lean_keyword_count": scores["lean_keyword_count"],
                 "imports": scores["imports"],
                 "unicode_nat": scores["unicode_nat"],
                 "ends_with_keyword": scores["ends_with_keyword"],
@@ -223,18 +282,22 @@ def main() -> int:
             w.writerow(row)
             f.flush()
             total_score += scores["score"]
+            total_soft += scores["soft_score"]
             max_expected = (
                 int(bool(p["expects"].get("theorem"))) +
                 int(bool(p["expects"].get("function"))) +
                 int("tactic" in p["expects"])
             )
             max_score += max_expected
-            print(f"[eval]   score={scores['score']}/{max_expected}  "
-                  f"{dt:.1f}s  has_thm={scores['has_theorem']}  "
-                  f"has_by={scores['has_by']}", flush=True)
+            print(f"[eval]   strict={scores['score']}/{max_expected}  "
+                  f"soft={scores['soft_score']}/3  {dt:.1f}s  "
+                  f"thm={scores['has_theorem']} by={scores['has_by']} "
+                  f"any_lean={scores['has_lean_keyword']}", flush=True)
 
     pct = (total_score / max_score * 100) if max_score else 0
-    print(f"[eval] total: {total_score}/{max_score} ({pct:.1f}%)", flush=True)
+    soft_pct = (total_soft / (3 * args.n_prompts) * 100) if args.n_prompts else 0
+    print(f"[eval] strict total: {total_score}/{max_score} ({pct:.1f}%)", flush=True)
+    print(f"[eval] soft total:   {total_soft}/{3 * args.n_prompts} ({soft_pct:.1f}%)", flush=True)
     print(f"[eval] CSV -> {out_path}", flush=True)
     return 0
 

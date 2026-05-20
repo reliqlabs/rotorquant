@@ -69,6 +69,12 @@ _BY_RE = re.compile(r":=\s*by\b")
 _FN_RE = re.compile(r"\b(def|fun)\s+\w+")
 _IMPORTS_RE = re.compile(r"^\s*import\s+\w+", re.MULTILINE)
 _UNICODE_NAT = re.compile(r"\bℕ\b")
+_LEAN_KEYWORD_RE = re.compile(
+    r"\b(theorem|lemma|example|def|fun|import\s+Mathlib|"
+    r"induction|simp|rfl|exact|intro|apply|cases|constructor|"
+    r"Nat\.|List\.|Prop\b|Type\s*[\d]*\b|⟨|⟩|≤|∀|∃|→|↦)"
+)
+_LEAN_CODEBLOCK_RE = re.compile(r"```\s*lean(?:4)?\b", re.IGNORECASE)
 
 
 def _score(text: str, expects: dict) -> dict:
@@ -80,6 +86,9 @@ def _score(text: str, expects: dict) -> dict:
         "unicode_nat":   bool(_UNICODE_NAT.search(text)),
         "char_count":    len(text),
         "ends_with_keyword": text.rstrip().endswith((":= rfl", ":= by", "done", "sorry")),
+        "has_lean_keyword": bool(_LEAN_KEYWORD_RE.search(text)),
+        "has_lean_codeblock": bool(_LEAN_CODEBLOCK_RE.search(text)),
+        "lean_keyword_count": len(_LEAN_KEYWORD_RE.findall(text)),
     }
     if "tactic" in expects:
         s[f"used_{expects['tactic']}"] = bool(
@@ -93,6 +102,15 @@ def _score(text: str, expects: dict) -> dict:
     if "tactic" in expects and s.get(f"used_{expects['tactic']}", False):
         pts += 1
     s["score"] = pts
+
+    soft = 0
+    if s["has_lean_keyword"]:
+        soft += 1
+    if s["has_theorem"] or s["has_function"]:
+        soft += 1
+    if s["has_by"] or s["ends_with_keyword"]:
+        soft += 1
+    s["soft_score"] = soft
     return s
 
 
@@ -102,7 +120,8 @@ def _score(text: str, expects: dict) -> dict:
     timeout=TIMEOUT_S,
     memory=200 * 1024,
 )
-def run_eval(max_tokens: int = 256, output_tag: str = "fp8-baseline") -> dict:
+def run_eval(max_tokens: int = 256, output_tag: str = "fp8-baseline",
+             temperature: float = 1.0, print_first: bool = True) -> dict:
     sys.path.insert(0, "/opt/rotorquant")
 
     import torch
@@ -144,8 +163,9 @@ def run_eval(max_tokens: int = 256, output_tag: str = "fp8-baseline") -> dict:
     csv_path = out_dir / f"lean_eval_max{max_tokens}.csv"
 
     fields = [
-        "name", "score", "char_count", "wall_seconds", "tok_per_sec",
-        "has_theorem", "has_by", "has_function", "imports",
+        "name", "score", "soft_score", "char_count", "wall_seconds", "tok_per_sec",
+        "has_theorem", "has_by", "has_function", "has_lean_keyword",
+        "has_lean_codeblock", "lean_keyword_count", "imports",
         "unicode_nat", "ends_with_keyword", "output",
     ]
     summary = {"per_prompt": [], "total_score": 0, "max_score": 0}
@@ -153,13 +173,12 @@ def run_eval(max_tokens: int = 256, output_tag: str = "fp8-baseline") -> dict:
     with csv_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        # Force the Mistral `<s>[INST] ... [/INST]` wrap explicitly. The first
-        # three prompts of the prior run scored 0/2 because
-        # `tokenizer.apply_chat_template` silently returned the unwrapped
-        # user message (the streaming-converted tokenizer ships with an
-        # empty chat_template attribute even though chat_template.jinja
-        # exists on disk). The literal `[INST]` form is what Leanstral was
-        # trained on; produced valid Lean code in the local Q3 smoke.
+        # Force the Mistral `<s>[INST] ... [/INST]` wrap explicitly + temp=1.0
+        # (Leanstral's README-recommended setting). Greedy decoding produced
+        # repetitive/short outputs in the first eval pass — every prompt
+        # scored 0/2 strict because the model didn't open with a `theorem`
+        # header. Soft scores now distinguish "valid Lean syntax somewhere"
+        # from "complete garbage".
         for i, p in enumerate(PROMPTS):
             print(f"[eval] [{i + 1}/{len(PROMPTS)}] {p['name']}", flush=True)
             prompt = f"<s>[INST] {p['user']} [/INST]"
@@ -168,27 +187,39 @@ def run_eval(max_tokens: int = 256, output_tag: str = "fp8-baseline") -> dict:
 
             inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
             t1 = time.time()
+            do_sample = temperature > 0
+            gen_kwargs = dict(
+                max_new_tokens=max_tokens,
+                pad_token_id=tokenizer.eos_token_id or 2,
+                do_sample=do_sample,
+            )
+            if do_sample:
+                gen_kwargs["temperature"] = temperature
             with torch.no_grad():
-                out_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=max_tokens,
-                    do_sample=False,  # greedy for reproducibility
-                    pad_token_id=tokenizer.eos_token_id or 2,
-                )
+                out_ids = model.generate(**inputs, **gen_kwargs)
             dt = time.time() - t1
             new_ids = out_ids[0, inputs.input_ids.shape[1]:]
             text = tokenizer.decode(new_ids, skip_special_tokens=True)
+
+            if print_first and i == 0:
+                print(f"[eval]   ---- raw output (first prompt) ----", flush=True)
+                print(text, flush=True)
+                print(f"[eval]   ---- end raw output ----", flush=True)
 
             scores = _score(text, p["expects"])
             row = {
                 "name": p["name"],
                 "score": scores["score"],
+                "soft_score": scores["soft_score"],
                 "char_count": scores["char_count"],
                 "wall_seconds": round(dt, 2),
                 "tok_per_sec": round(max_tokens / dt, 3),
                 "has_theorem": scores["has_theorem"],
                 "has_by": scores["has_by"],
                 "has_function": scores["has_function"],
+                "has_lean_keyword": scores["has_lean_keyword"],
+                "has_lean_codeblock": scores["has_lean_codeblock"],
+                "lean_keyword_count": scores["lean_keyword_count"],
                 "imports": scores["imports"],
                 "unicode_nat": scores["unicode_nat"],
                 "ends_with_keyword": scores["ends_with_keyword"],
@@ -196,6 +227,10 @@ def run_eval(max_tokens: int = 256, output_tag: str = "fp8-baseline") -> dict:
             }
             w.writerow(row)
             f.flush()
+            # Explicitly commit so a kill mid-run still leaves us with
+            # whatever rows landed (previous attempts lost everything to
+            # un-synced volume on kill).
+            ROTORQUANT_CALIB_VOL.commit()
 
             max_expected = (
                 int(bool(p["expects"].get("theorem"))) +
@@ -221,7 +256,12 @@ def run_eval(max_tokens: int = 256, output_tag: str = "fp8-baseline") -> dict:
 
 
 @app.local_entrypoint()
-def main(max_tokens: int = 256, output_tag: str = "fp8-baseline"):
-    summary = run_eval.remote(max_tokens=max_tokens, output_tag=output_tag)
+def main(max_tokens: int = 256, output_tag: str = "fp8-baseline",
+         temperature: float = 1.0):
+    summary = run_eval.remote(
+        max_tokens=max_tokens,
+        output_tag=output_tag,
+        temperature=temperature,
+    )
     print("---- summary ----")
     print(json.dumps(summary, indent=2))
