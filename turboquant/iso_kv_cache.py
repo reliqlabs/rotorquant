@@ -27,6 +27,7 @@ from .mlx_fused_iso_attention import (
     iso_compress,
     iso_decompress,
     iso_flash_decode,
+    iso_fused_sparse_attend,
 )
 
 
@@ -178,7 +179,12 @@ class IsoKVCache:
             + self.v_packed.nbytes + self.v_norms.nbytes
         )
 
-    def attend(self, query: mx.array, scale: float) -> mx.array:
+    def attend(
+        self,
+        query: mx.array,
+        scale: float,
+        topk: Optional[int] = None,
+    ) -> mx.array:
         """Compute scaled-dot-product attention directly against the packed
         cache via the fused Metal kernel — no decompression detour.
 
@@ -192,12 +198,33 @@ class IsoKVCache:
         Args:
             query: (B, H, 1, head_dim) — current decode-step query.
             scale: softmax temperature (1/sqrt(head_dim) typically).
+            topk: if set, route to the two-pass sparse path keeping only the
+                topk highest-scoring tokens per head. When `topk >= offset`
+                (i.e., not enough tokens to drop any), this still routes
+                through sparse_attend but with threshold=-inf so the result
+                matches dense flash decode within fp32 rounding. Leave None
+                to use the dense one-pass flash decode.
 
         Returns:
             (B, H, 1, head_dim) attention output.
         """
         if self.k_packed is None:
             raise RuntimeError("IsoKVCache.attend called before update_and_fetch")
+        if topk is not None:
+            return iso_fused_sparse_attend(
+                query=query,
+                k_packed=self.k_packed,
+                k_norms=self.k_norms,
+                v_packed=self.v_packed,
+                v_norms=self.v_norms,
+                centroids=self.centroids,
+                q_L=self.q_L,
+                q_R=self.q_R,
+                scale=scale,
+                dim=self.head_dim,
+                bits=self.iso_bits,
+                topk=topk,
+            )
         return iso_flash_decode(
             query=query,
             k_packed=self.k_packed,

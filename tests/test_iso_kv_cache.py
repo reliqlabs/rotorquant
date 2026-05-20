@@ -112,6 +112,60 @@ def test_attend_raises_before_update():
         cache.attend(q, 1.0)
 
 
+def test_attend_topk_keep_all_matches_dense():
+    """`attend(topk=T)` should route to sparse but with threshold=-inf, so
+    output matches the dense flash-decode path within fp32 rounding."""
+    import math
+    cache = _make_cache(head_dim=128, bits=3)
+    mx.random.seed(7)
+    T = 64
+    K = mx.random.normal((1, 2, T, 128))
+    V = mx.random.normal((1, 2, T, 128))
+    cache.update_and_fetch(K, V)
+
+    q = mx.random.normal((1, 2, 1, 128))
+    scale = 1.0 / math.sqrt(128)
+    dense = cache.attend(q, scale)
+    sparse_all = cache.attend(q, scale, topk=T + 16)
+    mx.eval(dense, sparse_all)
+    diff = mx.max(mx.abs(dense - sparse_all)).item()
+    assert diff < 5e-3, f"attend(topk>=T) vs attend(None) diff={diff:.3e}"
+
+
+def test_attend_topk_one_picks_top_token():
+    """`attend(topk=1)` should approximate V at argmax(QK)."""
+    import math
+    from turboquant.mlx_fused_iso_attention import iso_decompress
+    cache = _make_cache(head_dim=128, bits=3)
+    mx.random.seed(3)
+    T = 96
+    target = 41
+    # Background K small; dominant K at `target`.
+    K = mx.random.normal((1, 1, T, 128)) * 0.01
+    dominant = mx.random.normal((128,))
+    K = mx.concatenate([
+        K[:, :, :target, :],
+        dominant.reshape(1, 1, 1, 128),
+        K[:, :, target + 1:, :],
+    ], axis=2)
+    V = mx.random.normal((1, 1, T, 128))
+    cache.update_and_fetch(K, V)
+
+    q = dominant.reshape(1, 1, 1, 128)
+    scale = 1.0 / math.sqrt(128)
+    out = cache.attend(q, scale, topk=1)
+
+    V_dec = iso_decompress(
+        cache.v_packed.reshape(-1, cache.v_packed.shape[-1]),
+        cache.v_norms.reshape(-1),
+        128, 3, cache.q_L, cache.q_R, cache.centroids,
+    ).reshape(1, 1, T, 128)
+    expected = V_dec[0, 0, target]
+    mx.eval(out, expected)
+    diff = mx.max(mx.abs(out.reshape(128) - expected)).item()
+    assert diff < 1e-2, f"topk=1 attend diff vs V[target]: {diff:.3e}"
+
+
 def test_load_rotors_factory(tmp_path):
     """Round-trip rotors.safetensors -> factory -> per-layer cache."""
     import os
