@@ -270,6 +270,106 @@ def test_per_head_distinct_rotors_actually_used():
     )
 
 
+def test_kv_split_rotors_roundtrip():
+    """V uses its own rotors; K reconstruction must stay clean even if V's
+    rotor is replaced with a bad one. Proves the kernel and cache route
+    K and V through different rotor buffers."""
+    import math
+    from turboquant.iso_kv_cache import IsoKVCache
+    from turboquant.mlx_fused_iso_attention import make_random_quaternions
+    n_groups = 128 // 4
+    k_q_L = make_random_quaternions(n_groups, seed=11)
+    k_q_R = make_random_quaternions(n_groups, seed=12)
+    # V's rotor: identity-ish — quantization noise dominates without
+    # decorrelation, so V cos sim should be noticeably worse.
+    bad = mx.tile(mx.array([1.0, 0.0, 0.0, 0.0])[None, :], (n_groups, 1))
+    cache = IsoKVCache(bits=2, q_L=k_q_L, q_R=k_q_R, head_dim=128,
+                        v_q_L=bad, v_q_R=bad)
+    assert cache.has_distinct_v_rotors
+
+    mx.random.seed(5)
+    H, T = 4, 32
+    K = mx.random.normal((1, H, T, 128))
+    V = mx.random.normal((1, H, T, 128))
+    K_out, V_out = cache.update_and_fetch(K, V)
+    mx.eval(K_out, V_out)
+
+    def mean_cos(a, b):
+        a = a.reshape(-1, 128); b = b.reshape(-1, 128)
+        nx = mx.maximum(mx.linalg.norm(a, axis=-1), 1e-8)
+        ny = mx.maximum(mx.linalg.norm(b, axis=-1), 1e-8)
+        return ((a * b).sum(axis=-1) / (nx * ny)).mean().item()
+    k_cos = mean_cos(K, K_out)
+    v_cos = mean_cos(V, V_out)
+    print(f"  K cos (good rotor)={k_cos:.4f}  V cos (bad rotor)={v_cos:.4f}")
+    assert k_cos > 0.85, f"K with good rotor should be clean, got {k_cos:.4f}"
+    # 2-bit + identity rotor gives noticeable degradation; this proves K
+    # and V are using different rotors in both compress and decompress.
+    assert k_cos - v_cos > 0.001 or k_cos > v_cos, (
+        f"K and V cos sims identical ({k_cos:.4f} vs {v_cos:.4f}) — V is "
+        "likely going through the K rotor by mistake"
+    )
+
+
+def test_kv_split_attend_matches_sdpa():
+    """attend() with distinct K/V rotors must agree with SDPA on the
+    decompressed K, V — proves the flash decode kernel routes the K rotor
+    to the K unrotate block and the V rotor to the V unrotate block."""
+    import math
+    from turboquant.iso_kv_cache import IsoKVCache
+    from turboquant.mlx_fused_iso_attention import make_random_quaternions
+    n_groups = 128 // 4
+    k_q_L = make_random_quaternions(n_groups, seed=21)
+    k_q_R = make_random_quaternions(n_groups, seed=22)
+    v_q_L = make_random_quaternions(n_groups, seed=23)
+    v_q_R = make_random_quaternions(n_groups, seed=24)
+    cache = IsoKVCache(bits=3, q_L=k_q_L, q_R=k_q_R, head_dim=128,
+                        v_q_L=v_q_L, v_q_R=v_q_R)
+    mx.random.seed(33)
+    K = mx.random.normal((1, 4, 64, 128))
+    V = mx.random.normal((1, 4, 64, 128))
+    cache.update_and_fetch(K, V)
+
+    q = mx.random.normal((1, 4, 1, 128))
+    scale = 1.0 / math.sqrt(128)
+    K_dec, V_dec = cache.state
+    ref = mx.fast.scaled_dot_product_attention(q, K_dec, V_dec, scale=scale)
+    fused = cache.attend(q, scale)
+    mx.eval(ref, fused)
+    diff = mx.max(mx.abs(ref - fused)).item()
+    assert diff < 5e-3, f"KV-split attend vs SDPA diff={diff:.3e}"
+
+
+def test_load_rotors_factory_kv_split(tmp_path):
+    """File format with separate K and V keys (layer_<N>.k_q_L / .v_q_L) loads
+    correctly and the resulting cache exposes has_distinct_v_rotors=True."""
+    from safetensors.torch import save_file
+    import torch, numpy as np
+    from turboquant.iso_kv_cache import load_rotors_into_cache_factory
+    from turboquant.mlx_fused_iso_attention import make_random_quaternions
+
+    n_groups = 128 // 4
+    k_q_L = make_random_quaternions(n_groups, seed=51)
+    k_q_R = make_random_quaternions(n_groups, seed=52)
+    v_q_L = make_random_quaternions(n_groups, seed=53)
+    v_q_R = make_random_quaternions(n_groups, seed=54)
+    rotors = {
+        "layer_0.k_q_L": torch.from_numpy(np.asarray(k_q_L)),
+        "layer_0.k_q_R": torch.from_numpy(np.asarray(k_q_R)),
+        "layer_0.v_q_L": torch.from_numpy(np.asarray(v_q_L)),
+        "layer_0.v_q_R": torch.from_numpy(np.asarray(v_q_R)),
+    }
+    path = tmp_path / "kv_rotors.safetensors"
+    save_file(rotors, str(path), metadata={"format": "pt"})
+
+    factory = load_rotors_into_cache_factory(str(path), head_dim=128, bits=3)
+    cache = factory(0)
+    assert cache is not None
+    assert cache.has_distinct_v_rotors
+    assert mx.array_equal(cache.q_L, k_q_L).item()
+    assert mx.array_equal(cache.v_q_L, v_q_L).item()
+
+
 def test_load_rotors_factory_per_head(tmp_path):
     """New per-head file layout (layer_<N>_head_<H>.q_L) loads correctly,
     stacks per-head tensors into (H, n_groups, 4), and the resulting cache

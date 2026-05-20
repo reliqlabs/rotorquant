@@ -60,11 +60,14 @@ class IsoKVCache:
 
     Args:
         bits: 1..4 bits per quantized index.
-        q_L, q_R: quaternion rotors. Either `(n_groups, 4)` for a single
-            rotor broadcast across every head (legacy), OR
-            `(n_heads, n_groups, 4)` for per-head rotors. `q_R=None` ->
-            SO(3) fast mode regardless of q_L shape.
+        q_L, q_R: K rotors. Either `(n_groups, 4)` for a single rotor
+            broadcast across every head (legacy), OR `(n_heads, n_groups, 4)`
+            for per-head rotors. `q_R=None` -> SO(3) fast mode regardless of
+            shape. These rotors are used for K by default and also for V
+            unless `v_q_L`/`v_q_R` are provided.
         head_dim: must equal q_L.shape[-2] * 4 (3D q_L) or q_L.shape[0] * 4 (2D).
+        v_q_L, v_q_R: V rotors. Same shape rules as q_L/q_R. When None, V
+            uses the K rotors (single-rotor compatibility).
         centroids: optional override for the Lloyd-Max codebook (defaults to
             the precomputed d=128 grid; pass a per-d grid for other head_dims).
     """
@@ -83,10 +86,25 @@ class IsoKVCache:
         q_R: Optional[mx.array],
         head_dim: int,
         centroids: Optional[mx.array] = None,
+        v_q_L: Optional[mx.array] = None,
+        v_q_R: Optional[mx.array] = None,
     ):
         self.iso_bits = bits
+        # K rotors (also serve as V rotors when v_* are not provided).
         self.q_L = q_L
         self.q_R = q_R
+        # V rotors — fall back to K rotors if not specified.
+        self.v_q_L = v_q_L if v_q_L is not None else q_L
+        self.v_q_R = v_q_R if v_q_R is not None else q_R
+        # If we mixed has_qR between K and V the kernel can't distinguish, so
+        # require alignment up front.
+        if (q_R is None) != (self.v_q_R is None):
+            raise ValueError(
+                "IsoKVCache: q_R and v_q_R must agree on None-or-set "
+                f"(q_R={'None' if q_R is None else 'set'}, "
+                f"v_q_R={'None' if self.v_q_R is None else 'set'})"
+            )
+        self.has_distinct_v_rotors = v_q_L is not None
         self.head_dim = head_dim
         self.per_head_rotors = q_L.ndim == 3
         n_groups = q_L.shape[-2] if self.per_head_rotors else q_L.shape[0]
@@ -97,6 +115,11 @@ class IsoKVCache:
             assert q_R.shape == q_L.shape, (
                 f"per-head q_L shape {tuple(q_L.shape)} != "
                 f"q_R shape {tuple(q_R.shape)}"
+            )
+        if v_q_L is not None and v_q_L.shape != q_L.shape:
+            raise ValueError(
+                f"v_q_L shape {tuple(v_q_L.shape)} must match "
+                f"q_L shape {tuple(q_L.shape)}"
             )
         # `head_dim in _ISO_CODEBOOKS` was always False before (the dict is
         # keyed by bits) — falling through to compute_codebooks on every call.
@@ -132,9 +155,12 @@ class IsoKVCache:
     def values(self) -> Optional[mx.array]:
         return self._decompress_v() if self.offset > 0 else None
 
-    def _compress_block(self, K: mx.array) -> Tuple[mx.array, mx.array]:
+    def _compress_block(
+        self, K: mx.array, q_L: mx.array, q_R: Optional[mx.array],
+    ) -> Tuple[mx.array, mx.array]:
         """K shape: (B, H, T, D) -> (packed (B, H, T, packed_dim), norms (B, H, T)).
 
+        Caller passes the rotor set (K or V) so the same routine handles both.
         For per-head rotors we transpose so heads end up at axis -2 inside
         iso_compress (which the underlying iso_rotate requires for broadcast):
             (B, H, T, D) -> transpose -> (B, T, H, D) -> reshape -> (B*T, H, D).
@@ -143,24 +169,26 @@ class IsoKVCache:
         B, H, T, D = K.shape
         if self.per_head_rotors:
             K_perm = K.transpose(0, 2, 1, 3).reshape(B * T, H, D)
-            packed, norms = iso_compress(K_perm, self.iso_bits, self.q_L,
-                                          self.q_R, self.centroids)
+            packed, norms = iso_compress(K_perm, self.iso_bits, q_L, q_R, self.centroids)
             packed_dim = packed.shape[-1]
             packed = packed.reshape(B, T, H, packed_dim).transpose(0, 2, 1, 3)
             norms = norms.reshape(B, T, H).transpose(0, 2, 1)
             return packed, norms
         flat = K.reshape(-1, D)
-        packed, norms = iso_compress(flat, self.iso_bits, self.q_L, self.q_R, self.centroids)
+        packed, norms = iso_compress(flat, self.iso_bits, q_L, q_R, self.centroids)
         packed_dim = packed.shape[-1]
         return packed.reshape(B, H, T, packed_dim), norms.reshape(B, H, T)
 
     def _decompress_k(self) -> mx.array:
-        return self._decompress(self.k_packed, self.k_norms)
+        return self._decompress(self.k_packed, self.k_norms, self.q_L, self.q_R)
 
     def _decompress_v(self) -> mx.array:
-        return self._decompress(self.v_packed, self.v_norms)
+        return self._decompress(self.v_packed, self.v_norms, self.v_q_L, self.v_q_R)
 
-    def _decompress(self, packed: mx.array, norms: mx.array) -> mx.array:
+    def _decompress(
+        self, packed: mx.array, norms: mx.array,
+        q_L: mx.array, q_R: Optional[mx.array],
+    ) -> mx.array:
         """(B, H, T, packed_dim) + (B, H, T) -> (B, H, T, head_dim)."""
         B, H, T, _ = packed.shape
         if self.per_head_rotors:
@@ -168,14 +196,14 @@ class IsoKVCache:
             norms_perm = norms.transpose(0, 2, 1).reshape(B * T, H)
             out = iso_decompress(
                 packed_perm, norms_perm, self.head_dim, self.iso_bits,
-                self.q_L, self.q_R, self.centroids,
+                q_L, q_R, self.centroids,
             )
             return out.reshape(B, T, H, self.head_dim).transpose(0, 2, 1, 3)
         flat_packed = packed.reshape(-1, packed.shape[-1])
         flat_norms = norms.reshape(-1)
         flat_out = iso_decompress(
             flat_packed, flat_norms, self.head_dim, self.iso_bits,
-            self.q_L, self.q_R, self.centroids,
+            q_L, q_R, self.centroids,
         )
         return flat_out.reshape(B, H, T, self.head_dim)
 
@@ -185,8 +213,8 @@ class IsoKVCache:
         K, V shape: (B, n_kv_heads, T_new, head_dim).
         Returns the same shape but with T = total tokens cached.
         """
-        new_k_packed, new_k_norms = self._compress_block(K)
-        new_v_packed, new_v_norms = self._compress_block(V)
+        new_k_packed, new_k_norms = self._compress_block(K, self.q_L, self.q_R)
+        new_v_packed, new_v_norms = self._compress_block(V, self.v_q_L, self.v_q_R)
 
         if self.k_packed is None:
             self.k_packed = new_k_packed
@@ -252,6 +280,8 @@ class IsoKVCache:
                 centroids=self.centroids,
                 q_L=self.q_L,
                 q_R=self.q_R,
+                v_q_L=self.v_q_L,
+                v_q_R=self.v_q_R,
                 scale=scale,
                 dim=self.head_dim,
                 bits=self.iso_bits,
@@ -264,6 +294,8 @@ class IsoKVCache:
             v_packed=self.v_packed,
             v_norms=self.v_norms,
             centroids=self.centroids,
+            v_q_L=self.v_q_L,
+            v_q_R=self.v_q_R,
             q_L=self.q_L,
             q_R=self.q_R,
             scale=scale,
@@ -276,18 +308,16 @@ def load_rotors_into_cache_factory(rotors_path: str, head_dim: int, bits: int = 
     """Read a `rotors.safetensors` produced by Modal calibration and return a
     factory `(layer_idx: int) -> IsoKVCache | None`.
 
-    Supports two layouts:
-      - per-layer (legacy): keys `layer_<N>.q_L` / `layer_<N>.q_R`. One rotor
-        per layer, broadcast across all heads. q_L shape (n_groups, 4).
-      - per-head: keys `layer_<N>_head_<H>.q_L` / `layer_<N>_head_<H>.q_R`.
-        Stacked into `(n_heads, n_groups, 4)` before being handed to the cache.
-        Heads missing from the file get a zero-rotor row that the kernel
-        will treat as identity-ish; this is a calibration bug if it ever
-        happens so we warn instead.
-
-    Use:
-        cache_factory = load_rotors_into_cache_factory("rotors.safetensors", 128, 3)
-        caches = [cache_factory(i) or KVCache() for i in range(model.n_layers)]
+    Supports three file layouts, auto-detected from the key suffixes:
+      1. Legacy single rotor per layer:
+            `layer_<N>.q_L` (+ `.q_R`). One rotor used for both K and V.
+      2. Per-head single rotor:
+            `layer_<N>_head_<H>.q_L` (+ `.q_R`). One per (layer, head); used
+            for both K and V.
+      3. Separate K and V rotors (this commit's primary case):
+            `layer_<N>.k_q_L` / `.k_q_R` / `.v_q_L` / `.v_q_R` (or per-head
+            variants `layer_<N>_head_<H>.k_q_L` etc). K and V get independent
+            rotors loaded into IsoKVCache(q_L=K, v_q_L=V, ...).
 
     Layers not present in the rotors file fall back to `None` so the caller
     can substitute a standard KVCache for those layers.
@@ -298,13 +328,23 @@ def load_rotors_into_cache_factory(rotors_path: str, head_dim: int, bits: int = 
         from safetensors.numpy import load_file
         loaded = {k: mx.array(v) for k, v in load_file(rotors_path).items()}
 
-    per_layer: dict[int, dict[str, mx.array]] = {}
-    per_head: dict[int, dict[int, dict[str, mx.array]]] = {}
+    # Bin each tensor by (layer, head_or_None, kv-or-shared, which).
+    # `head` is None for per-layer entries. `kv` is "k", "v", or "" (shared).
+    # `which` is "q_L" or "q_R".
+    by_layer: dict[int, dict] = {}
     for key, tensor in loaded.items():
-        # Try the per-head pattern first: layer_<N>_head_<H>.q_{L,R}
         try:
-            stem, which = key.split(".")
+            stem, suffix = key.split(".")
         except ValueError:
+            continue
+        if not stem.startswith("layer_"):
+            continue
+        # Suffix can be q_L, q_R, k_q_L, k_q_R, v_q_L, v_q_R.
+        if suffix in ("q_L", "q_R"):
+            kv, which = "", suffix
+        elif suffix in ("k_q_L", "k_q_R", "v_q_L", "v_q_R"):
+            kv, which = suffix[0], suffix[2:]
+        else:
             continue
         if "_head_" in stem:
             try:
@@ -313,51 +353,73 @@ def load_rotors_into_cache_factory(rotors_path: str, head_dim: int, bits: int = 
                 hi = int(head_part)
             except ValueError:
                 continue
-            per_head.setdefault(li, {}).setdefault(hi, {})[which] = tensor
-        elif stem.startswith("layer_"):
+            head_key: Optional[int] = hi
+        else:
             try:
                 li = int(stem.removeprefix("layer_"))
             except ValueError:
                 continue
-            per_layer.setdefault(li, {})[which] = tensor
+            head_key = None
+        by_layer.setdefault(li, {}).setdefault(head_key, {}).setdefault(kv, {})[which] = tensor
 
-    def _stack_per_head(layer_idx: int) -> tuple[mx.array, Optional[mx.array]]:
-        entries = per_head[layer_idx]
-        n_heads = max(entries) + 1
-        q_L_list, q_R_list, has_qR = [], [], False
+    def _stack_heads(layer_idx: int, entries_per_head: dict, kv: str
+                      ) -> tuple[mx.array, Optional[mx.array]]:
+        """Stack per-head tensors for one rotor kind into (H, n_groups, 4)."""
+        n_heads = max(entries_per_head) + 1
+        q_L_list, q_R_list = [], []
+        any_qR = False
         for hi in range(n_heads):
-            e = entries.get(hi)
-            if e is None or "q_L" not in e:
+            e = entries_per_head.get(hi, {}).get(kv, {})
+            if "q_L" not in e:
                 raise ValueError(
-                    f"rotors file missing layer_{layer_idx}_head_{hi}.q_L"
+                    f"rotors file missing layer_{layer_idx}_head_{hi}."
+                    f"{(kv + '_') if kv else ''}q_L"
                 )
             q_L_list.append(e["q_L"])
             qR = e.get("q_R")
-            if qR is not None:
-                has_qR = True
-                q_R_list.append(qR)
-            else:
-                q_R_list.append(None)
+            q_R_list.append(qR)
+            any_qR = any_qR or (qR is not None)
         q_L = mx.stack(q_L_list, axis=0)
-        if has_qR:
+        if any_qR:
             if any(x is None for x in q_R_list):
                 raise ValueError(
-                    f"layer_{layer_idx}: some heads have q_R and others don't"
+                    f"layer_{layer_idx}: some heads have {kv}_q_R and others don't"
                 )
-            q_R = mx.stack(q_R_list, axis=0)
-        else:
-            q_R = None
-        return q_L, q_R
+            return q_L, mx.stack(q_R_list, axis=0)
+        return q_L, None
+
+    def _read_one_rotor(layer_idx: int, layer_entries: dict, kv: str
+                         ) -> tuple[mx.array, Optional[mx.array]]:
+        """Read one rotor kind ('k', 'v', or '') as either per-layer or per-head."""
+        # Per-layer first.
+        per_layer_entry = layer_entries.get(None, {}).get(kv)
+        if per_layer_entry is not None and "q_L" in per_layer_entry:
+            return per_layer_entry["q_L"], per_layer_entry.get("q_R")
+        # Otherwise stack per-head.
+        per_head_entries = {hi: he for hi, he in layer_entries.items()
+                            if hi is not None and kv in he}
+        if per_head_entries:
+            return _stack_heads(layer_idx, per_head_entries, kv)
+        raise KeyError(f"layer {layer_idx}: no {kv!r} rotor found")
 
     def factory(layer_idx: int) -> Optional[IsoKVCache]:
-        if layer_idx in per_head:
-            q_L, q_R = _stack_per_head(layer_idx)
-        elif layer_idx in per_layer:
-            entry = per_layer[layer_idx]
-            q_L = entry["q_L"]
-            q_R = entry.get("q_R")
-        else:
+        layer_entries = by_layer.get(layer_idx)
+        if not layer_entries:
             return None
-        return IsoKVCache(bits=bits, q_L=q_L, q_R=q_R, head_dim=head_dim)
+        # Distinct K + V if either k_* or v_* keys exist; else fall back to
+        # the shared rotor for both.
+        has_kv_split = any(
+            kv in entry for entry in layer_entries.values() for kv in ("k", "v")
+        )
+        if has_kv_split:
+            q_L, q_R = _read_one_rotor(layer_idx, layer_entries, "k")
+            v_q_L, v_q_R = _read_one_rotor(layer_idx, layer_entries, "v")
+        else:
+            q_L, q_R = _read_one_rotor(layer_idx, layer_entries, "")
+            v_q_L, v_q_R = None, None
+        return IsoKVCache(
+            bits=bits, q_L=q_L, q_R=q_R, head_dim=head_dim,
+            v_q_L=v_q_L, v_q_R=v_q_R,
+        )
 
     return factory

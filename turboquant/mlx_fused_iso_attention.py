@@ -739,7 +739,7 @@ ISO_FLASH_DECODE_KERNEL = """
         kv_shared[elem] = k_val;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ── Inverse quaternion sandwich on K (4-block per thread%4==0) ───
+        // ── Inverse quaternion sandwich on K — uses K rotor (k_q_L/k_q_R) ─
         if (elem % 4 == 0) {
             uint group_idx = elem / 4;
             uint qbase = head_in_layer * dim + group_idx * 4;
@@ -749,10 +749,10 @@ ISO_FLASH_DECODE_KERNEL = """
             float v2 = kv_shared[elem + 2];
             float v3 = kv_shared[elem + 3];
 
-            float qlw =  q_L[qbase + 0];
-            float qlx = -q_L[qbase + 1];
-            float qly = -q_L[qbase + 2];
-            float qlz = -q_L[qbase + 3];
+            float qlw =  k_q_L[qbase + 0];
+            float qlx = -k_q_L[qbase + 1];
+            float qly = -k_q_L[qbase + 2];
+            float qlz = -k_q_L[qbase + 3];
 
             float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
             float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
@@ -760,10 +760,10 @@ ISO_FLASH_DECODE_KERNEL = """
             float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
 
             if (has_qR == 1u) {
-                float qrw = q_R[qbase + 0];
-                float qrx = q_R[qbase + 1];
-                float qry = q_R[qbase + 2];
-                float qrz = q_R[qbase + 3];
+                float qrw = k_q_R[qbase + 0];
+                float qrx = k_q_R[qbase + 1];
+                float qry = k_q_R[qbase + 2];
+                float qrz = k_q_R[qbase + 3];
                 kv_shared[elem]     = tw * qrw - tx * qrx - ty * qry - tz * qrz;
                 kv_shared[elem + 1] = tw * qrx + tx * qrw + ty * qrz - tz * qry;
                 kv_shared[elem + 2] = tw * qry - tx * qrz + ty * qrw + tz * qrx;
@@ -814,7 +814,7 @@ ISO_FLASH_DECODE_KERNEL = """
         kv_shared[elem] = v_val;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ── Inverse quaternion sandwich on V ─────────────────────────────
+        // ── Inverse quaternion sandwich on V — uses V rotor (v_q_L/v_q_R) ─
         if (elem % 4 == 0) {
             uint group_idx = elem / 4;
             uint qbase = head_in_layer * dim + group_idx * 4;
@@ -824,10 +824,10 @@ ISO_FLASH_DECODE_KERNEL = """
             float v2 = kv_shared[elem + 2];
             float v3 = kv_shared[elem + 3];
 
-            float qlw =  q_L[qbase + 0];
-            float qlx = -q_L[qbase + 1];
-            float qly = -q_L[qbase + 2];
-            float qlz = -q_L[qbase + 3];
+            float qlw =  v_q_L[qbase + 0];
+            float qlx = -v_q_L[qbase + 1];
+            float qly = -v_q_L[qbase + 2];
+            float qlz = -v_q_L[qbase + 3];
 
             float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
             float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
@@ -835,10 +835,10 @@ ISO_FLASH_DECODE_KERNEL = """
             float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
 
             if (has_qR == 1u) {
-                float qrw = q_R[qbase + 0];
-                float qrx = q_R[qbase + 1];
-                float qry = q_R[qbase + 2];
-                float qrz = q_R[qbase + 3];
+                float qrw = v_q_R[qbase + 0];
+                float qrx = v_q_R[qbase + 1];
+                float qry = v_q_R[qbase + 2];
+                float qrz = v_q_R[qbase + 3];
                 kv_shared[elem]     = tw * qrw - tx * qrx - ty * qry - tz * qrz;
                 kv_shared[elem + 1] = tw * qrx + tx * qrw + ty * qrz - tz * qry;
                 kv_shared[elem + 2] = tw * qry - tx * qrz + ty * qrw + tz * qrx;
@@ -883,20 +883,26 @@ def iso_flash_decode(
     scale: float,
     dim: int,
     bits: int,
+    v_q_L: Optional[mx.array] = None,
+    v_q_R: Optional[mx.array] = None,
 ) -> mx.array:
     """Fully fused IsoQuant flash decode.
 
     Each threadgroup processes a `ISO_TILE_SIZE`-token tile for one head, doing
-    unpack(K) → inverse-iso-rotate(K) → QK dot → online softmax update →
-    unpack(V) → inverse-iso-rotate(V) → accumulate(es * V) without writing
-    any FP intermediate K/V to device memory. Tiles are merged via log-sum-exp
-    in Python on the way out.
+    unpack(K) → inverse-iso-rotate(K, K-rotor) → QK dot → online softmax →
+    unpack(V) → inverse-iso-rotate(V, V-rotor) → accumulate(es * V) without
+    writing any FP intermediate K/V to device memory. Tiles are merged via
+    log-sum-exp in Python on the way out.
 
     Args:
         query: (B, H, 1, D) — current decode-step query.
         k_packed, k_norms: iso-packed K cache (see iso_compress for layout).
         v_packed, v_norms: iso-packed V cache.
-        centroids, q_L, q_R, scale, dim, bits: as for `iso_fused_qk_scores`.
+        centroids: Lloyd-Max codebook for `bits`.
+        q_L, q_R: K rotors. Shape (n_groups, 4) or (n_heads, n_groups, 4).
+        v_q_L, v_q_R: V rotors with the same shape. When None, V reuses
+            (q_L, q_R) — preserves the pre-K/V-split behavior.
+        scale, dim, bits: as for `iso_fused_qk_scores`.
 
     Returns:
         out (B, H, 1, D) — attention output. Equivalent to a softmax(QK·scale)·V
@@ -908,7 +914,7 @@ def iso_flash_decode(
             name="iso_flash_decode",
             input_names=[
                 "query", "k_packed", "k_norms", "v_packed", "v_norms",
-                "centroids", "q_L", "q_R", "scale", "dims",
+                "centroids", "k_q_L", "k_q_R", "v_q_L", "v_q_R", "scale", "dims",
             ],
             output_names=["partial_o", "tile_max", "tile_sum_exp"],
             source=ISO_FLASH_DECODE_KERNEL,
@@ -923,8 +929,26 @@ def iso_flash_decode(
     n_bh = B * H
     assert dim % 4 == 0 and dim <= 1024
 
+    # K rotors are the canonical ones; V rotors default to the K rotors.
+    if v_q_L is None:
+        v_q_L = q_L
+    if v_q_R is None:
+        v_q_R = q_R
     has_qR = 1 if q_R is not None else 0
-    q_L_flat, q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, dim)
+    # has_qR is a single flag shared by K and V. If one path has q_R and the
+    # other doesn't, the safe move is to require explicit alignment from the
+    # caller — bug surface otherwise.
+    assert (q_R is None) == (v_q_R is None), (
+        "iso_flash_decode: K and V rotors must agree on q_R-or-None "
+        f"(got q_R={'None' if q_R is None else 'set'}, "
+        f"v_q_R={'None' if v_q_R is None else 'set'})"
+    )
+    k_q_L_flat, k_q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, dim)
+    v_q_L_flat, v_q_R_flat, n_heads_real_v = _prepare_rotors_for_kernel(v_q_L, v_q_R, dim)
+    assert n_heads_real == n_heads_real_v, (
+        f"iso_flash_decode: K rotor n_heads={n_heads_real} != V rotor "
+        f"n_heads={n_heads_real_v}"
+    )
 
     scale_arr = mx.array([scale], dtype=mx.float32)
     dims_arr = mx.array(
@@ -939,7 +963,8 @@ def iso_flash_decode(
             k_norms.astype(mx.float32).reshape(n_bh * seq_len),
             v_packed.astype(mx.uint32).reshape(n_bh * seq_len * p_dim),
             v_norms.astype(mx.float32).reshape(n_bh * seq_len),
-            centroids, q_L_flat, q_R_flat, scale_arr, dims_arr,
+            centroids, k_q_L_flat, k_q_R_flat, v_q_L_flat, v_q_R_flat,
+            scale_arr, dims_arr,
         ],
         template=[("T", mx.float32)],
         grid=(num_tiles * dim, n_bh, 1),
@@ -1276,24 +1301,21 @@ def iso_fused_sparse_attend(
     dim: int,
     bits: int,
     topk: int = 1024,
+    v_q_L: Optional[mx.array] = None,
+    v_q_R: Optional[mx.array] = None,
 ) -> mx.array:
     """Two-pass sparse attention over iso-quantized K, V.
 
     Mirrors `fused_sparse_attend` from the planar module: phase1 scores all
-    tokens with QK + iso decompress on K, the bridge picks a per-head
-    threshold equal to the topk-th highest score, phase2 does online
-    softmax + V iso decompress + accumulate only for tokens at or above
-    the threshold. Output shape and LSE merge match `iso_flash_decode`,
-    so the two are drop-in interchangeable at the call site.
-
-    When `topk >= seq_len`, the threshold ends up at the minimum score
-    so phase2 visits every token and the result is numerically identical
-    to `iso_flash_decode` (modulo a difference in the score-write order
-    inside fp32 — usually < 1e-4).
+    tokens with QK + iso decompress on K (using `q_L`/`q_R` — the K rotors),
+    the bridge picks a per-head threshold equal to the topk-th highest score,
+    phase2 does online softmax + V iso decompress + accumulate only for
+    tokens at or above the threshold (using `v_q_L`/`v_q_R` — the V rotors,
+    or `q_L`/`q_R` again if those args default to None).
 
     Args:
-        query, k_packed, k_norms, v_packed, v_norms, centroids, q_L, q_R,
-        scale, dim, bits: same as `iso_flash_decode`.
+        q_L, q_R: K rotors.
+        v_q_L, v_q_R: V rotors. Default to K rotors (legacy single-rotor mode).
         topk: keep only the top-k highest-scoring tokens per head.
 
     Returns: (B, H, 1, dim).
@@ -1326,8 +1348,20 @@ def iso_fused_sparse_attend(
     top_per_tile = 4
     assert dim % 4 == 0 and dim <= 1024
 
+    if v_q_L is None:
+        v_q_L = q_L
+    if v_q_R is None:
+        v_q_R = q_R
+    assert (q_R is None) == (v_q_R is None), (
+        "iso_fused_sparse_attend: K and V rotors must agree on q_R-or-None"
+    )
     has_qR = 1 if q_R is not None else 0
-    q_L_flat, q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, dim)
+    k_q_L_flat, k_q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, dim)
+    v_q_L_flat, v_q_R_flat, n_heads_real_v = _prepare_rotors_for_kernel(v_q_L, v_q_R, dim)
+    assert n_heads_real == n_heads_real_v, (
+        f"sparse attend: K rotor n_heads={n_heads_real} != V rotor "
+        f"n_heads={n_heads_real_v}"
+    )
 
     scale_arr = mx.array([scale], dtype=mx.float32)
     dims_arr = mx.array(
@@ -1335,13 +1369,13 @@ def iso_fused_sparse_attend(
         dtype=mx.uint32,
     )
 
-    # ── Phase 1: score all tokens, collect per-tile top-4 ────────────────
+    # ── Phase 1: score all tokens with K rotors ─────────────────────────
     phase1_out = _iso_phase1_kernel(
         inputs=[
             query.astype(mx.float32).reshape(n_bh * dim),
             k_packed.astype(mx.uint32).reshape(n_bh * seq_len * p_dim),
             k_norms.astype(mx.float32).reshape(n_bh * seq_len),
-            centroids, q_L_flat, q_R_flat, scale_arr, dims_arr,
+            centroids, k_q_L_flat, k_q_R_flat, scale_arr, dims_arr,
         ],
         template=[("T", mx.float32)],
         grid=(num_tiles * dim, n_bh, 1),
@@ -1374,13 +1408,13 @@ def iso_fused_sparse_attend(
         threshold = mx.min(all_tops, axis=-1)
     mx.eval(threshold)  # tiny array — flush before phase2 dispatch
 
-    # ── Phase 2: sparse V decompress + online softmax ────────────────────
+    # ── Phase 2: sparse V decompress + online softmax — uses V rotors ───
     phase2_out = _iso_phase2_sparse_kernel(
         inputs=[
             all_scores,
             v_packed.astype(mx.uint32).reshape(n_bh * seq_len * p_dim),
             v_norms.astype(mx.float32).reshape(n_bh * seq_len),
-            centroids, q_L_flat, q_R_flat, threshold, dims_arr,
+            centroids, v_q_L_flat, v_q_R_flat, threshold, dims_arr,
         ],
         template=[("T", mx.float32)],
         grid=(num_tiles * dim, n_bh, 1),
