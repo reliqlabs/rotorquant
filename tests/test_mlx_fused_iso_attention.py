@@ -206,3 +206,44 @@ def test_planar_compress_decompress_cosine():
     mx.eval(cos)
     avg = mx.mean(cos).item()
     assert avg > 0.95, f"planar avg cosine={avg:.4f}"
+
+
+# ── Metal kernel parity (step E foundation) ────────────────────────────────
+
+
+@pytest.mark.parametrize("mode", ["full", "fast"])
+@pytest.mark.parametrize("d", [64, 128, 256])
+def test_iso_unrotate_metal_matches_mlx(mode, d):
+    """Metal-fused iso_unrotate must match the pure-MLX iso_unrotate elementwise."""
+    from turboquant.mlx_fused_iso_attention import (
+        iso_unrotate, iso_unrotate_metal, make_random_quaternions,
+    )
+    mx.random.seed(0)
+    n_groups = d // 4
+    q_L = make_random_quaternions(n_groups, seed=7)
+    q_R = make_random_quaternions(n_groups, seed=8) if mode == "full" else None
+
+    x = mx.random.normal((4, d))
+    ref = iso_unrotate(x, q_L, q_R)
+    metal_out = iso_unrotate_metal(x, q_L, q_R)
+    mx.eval(ref, metal_out)
+    diff = mx.max(mx.abs(ref - metal_out)).item()
+    assert diff < 1e-4, f"Metal vs MLX iso_unrotate diff={diff:.3e} (mode={mode}, d={d})"
+
+
+def test_iso_metal_full_roundtrip():
+    """forward MLX iso_rotate + Metal iso_unrotate_metal should round-trip."""
+    from turboquant.mlx_fused_iso_attention import (
+        iso_rotate, iso_unrotate_metal, make_random_quaternions,
+    )
+    mx.random.seed(0)
+    d = 128
+    n_groups = d // 4
+    q_L = make_random_quaternions(n_groups, seed=11)
+    q_R = make_random_quaternions(n_groups, seed=12)
+
+    x = mx.random.normal((6, d))
+    back = iso_unrotate_metal(iso_rotate(x, q_L, q_R), q_L, q_R)
+    mx.eval(back)
+    diff = mx.max(mx.abs(x - back)).item()
+    assert diff < 1e-3, f"full-cycle roundtrip diff={diff:.3e}"

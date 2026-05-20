@@ -231,3 +231,120 @@ def iso_decompress(
     # Move to rotated full-scale via per-token norm: kernel pattern `centroid * norms`
     rotated_full = values * norms[..., None]
     return iso_unrotate(rotated_full, q_L, q_R).astype(dtype)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step E (Metal fusion) — building block #1: inverse quaternion rotation
+#
+# This is the foundation for the fused QK / SV / flash-decode IsoQuant kernels
+# that mirror PR #8's PlanarQuant family. Each of those kernels does a small
+# inverse rotation in shared memory before the dot product or accumulation —
+# the math below is exactly that step, lifted out as a standalone kernel so we
+# can validate it independently before composing it into a full attention path.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+ISO_INVERSE_ROTATE_KERNEL = """
+    uint row = threadgroup_position_in_grid.x;     // which row of (B, d)
+    uint elem = thread_position_in_threadgroup.x;  // element index in [0, d)
+    uint d = dims[0];
+    uint n_groups = dims[1];
+    uint has_qR = dims[2];
+
+    // Stage row into shared memory so threads in a 4-group can read peers.
+    threadgroup float v_shared[1024];
+    v_shared[elem] = (float)x[row * d + elem];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each 4-block is handled by the thread whose elem index is its starting position.
+    if (elem % 4 == 0) {
+        uint group_idx = elem / 4;
+        uint qbase = group_idx * 4;
+
+        float v0 = v_shared[elem];
+        float v1 = v_shared[elem + 1];
+        float v2 = v_shared[elem + 2];
+        float v3 = v_shared[elem + 3];
+
+        // conj(q_L) = (qlw, -qlx, -qly, -qlz)
+        float qlw =  q_L[qbase + 0];
+        float qlx = -q_L[qbase + 1];
+        float qly = -q_L[qbase + 2];
+        float qlz = -q_L[qbase + 3];
+
+        // temp = conj(q_L) * v  (Hamilton product)
+        float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
+        float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
+        float ty = qlw * v2 - qlx * v3 + qly * v0 + qlz * v1;
+        float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
+
+        float rw, rx, ry, rz;
+        if (has_qR == 1u) {
+            float qrw = q_R[qbase + 0];
+            float qrx = q_R[qbase + 1];
+            float qry = q_R[qbase + 2];
+            float qrz = q_R[qbase + 3];
+            rw = tw * qrw - tx * qrx - ty * qry - tz * qrz;
+            rx = tw * qrx + tx * qrw + ty * qrz - tz * qry;
+            ry = tw * qry - tx * qrz + ty * qrw + tz * qrx;
+            rz = tw * qrz + tx * qry - ty * qrx + tz * qrw;
+        } else {
+            rw = tw; rx = tx; ry = ty; rz = tz;
+        }
+
+        v_shared[elem]     = rw;
+        v_shared[elem + 1] = rx;
+        v_shared[elem + 2] = ry;
+        v_shared[elem + 3] = rz;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    out[row * d + elem] = (T)v_shared[elem];
+"""
+
+
+_iso_inverse_rotate_kernel = None
+
+
+def iso_unrotate_metal(x: mx.array, q_L: mx.array, q_R: Optional[mx.array] = None) -> mx.array:
+    """Metal-fused inverse IsoQuant rotation. Equivalent to `iso_unrotate` but
+    runs a single Metal threadgroup per row.
+
+    x: (..., d) — flattens the leading dims into row index for the kernel.
+    q_L: (n_groups, 4); q_R: (n_groups, 4) or None for fast mode.
+    Returns: same shape as `x`.
+    """
+    global _iso_inverse_rotate_kernel
+    if _iso_inverse_rotate_kernel is None:
+        _iso_inverse_rotate_kernel = mx.fast.metal_kernel(
+            name="iso_inverse_rotate",
+            input_names=["x", "q_L", "q_R", "dims"],
+            output_names=["out"],
+            source=ISO_INVERSE_ROTATE_KERNEL,
+        )
+
+    d = x.shape[-1]
+    n_groups = q_L.shape[0]
+    assert d == n_groups * 4, f"d={d} must equal n_groups*4 ({n_groups * 4})"
+    assert d <= 1024, "ISO_INVERSE_ROTATE_KERNEL shared-memory layout assumes d ≤ 1024"
+
+    original_shape = x.shape
+    n_rows = 1
+    for s in original_shape[:-1]:
+        n_rows *= s
+
+    x_flat = x.astype(mx.float32).reshape(n_rows, d)
+    q_L_flat = q_L.astype(mx.float32).reshape(-1)  # (n_groups * 4,)
+    has_qR = 1 if q_R is not None else 0
+    q_R_flat = (q_R if q_R is not None else mx.zeros_like(q_L)).astype(mx.float32).reshape(-1)
+    dims_arr = mx.array([d, n_groups, has_qR], dtype=mx.uint32)
+
+    outputs = _iso_inverse_rotate_kernel(
+        inputs=[x_flat, q_L_flat, q_R_flat, dims_arr],
+        template=[("T", mx.float32)],
+        grid=(n_rows * d, 1, 1),
+        threadgroup=(d, 1, 1),
+        output_shapes=[(n_rows * d,)],
+        output_dtypes=[mx.float32],
+    )
+    return outputs[0].reshape(original_shape).astype(x.dtype)
