@@ -112,10 +112,15 @@ def calibrate(
     # AutoModelForCausalLM doesn't know about it; use the generic AutoModel
     # which routes via _model_mapping to Mistral3ForConditionalGeneration.
     cfg = AutoConfig.from_pretrained(HF_INTERMEDIATE_DIR)
+    # The kernels package's grouped_mm MoE dispatch doesn't support our static
+    # FP8 activation scheme. Force 'dynamic' so forward picks the eager path
+    # that does work; the stored activation_scale tensors just become no-ops.
+    _coerce_activation_scheme_to_dynamic(cfg)
     if cfg.model_type == "mistral3":
         from transformers import Mistral3ForConditionalGeneration
         model = Mistral3ForConditionalGeneration.from_pretrained(
             HF_INTERMEDIATE_DIR,
+            config=cfg,
             torch_dtype=torch.bfloat16,
             device_map="auto",
         )
@@ -123,6 +128,7 @@ def calibrate(
         from transformers import AutoModelForCausalLM
         model = AutoModelForCausalLM.from_pretrained(
             HF_INTERMEDIATE_DIR,
+            config=cfg,
             torch_dtype=torch.bfloat16,
             device_map="auto",
         )
@@ -222,6 +228,21 @@ def calibrate(
 
 
 # ── Hook / search helpers (run inside the Modal container) ──────────────────
+
+
+def _coerce_activation_scheme_to_dynamic(cfg):
+    """Mutate cfg.quantization_config so the MoE forward picks the eager path.
+
+    Handles both the dict and FP8Config object shapes that transformers may
+    surface depending on version.
+    """
+    qc = getattr(cfg, "quantization_config", None)
+    if qc is None:
+        return
+    if hasattr(qc, "activation_scheme"):
+        qc.activation_scheme = "dynamic"
+    elif isinstance(qc, dict):
+        qc["activation_scheme"] = "dynamic"
 
 
 def _find_decoder_layers(model):
