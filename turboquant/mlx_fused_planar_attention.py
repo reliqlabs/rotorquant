@@ -943,3 +943,104 @@ def planar_flash_decode(
     result = numerator / (denominator + 1e-8)
 
     return result.reshape(B, H, 1, dim)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Python-side helpers (PR #8 left these out — test_mlx_fused_attention.py
+# imports them but they were never committed). Adding them here unblocks the
+# existing test suite and provides a reference compress/decompress that the
+# IsoQuant module mirrors.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SQRT2_2 = 1.0 / math.sqrt(2.0)
+_VALS_PER_WORD = {1: 32, 2: 16, 3: 10, 4: 8}
+
+
+def _planar_rotate(x: mx.array) -> mx.array:
+    """Forward 45° Givens on adjacent pairs of the last axis.
+    (a, b) -> ((a-b)/√2, (a+b)/√2).  Matches R = [[c,-s],[s,c]] with c=s=1/√2.
+    """
+    d = x.shape[-1]
+    paired = x.reshape(*x.shape[:-1], d // 2, 2)
+    a = paired[..., 0]
+    b = paired[..., 1]
+    out = mx.stack([(a - b) * _SQRT2_2, (a + b) * _SQRT2_2], axis=-1)
+    return out.reshape(*x.shape)
+
+
+def _planar_unrotate(x: mx.array) -> mx.array:
+    """Inverse of `_planar_rotate`: (a, b) -> ((a+b)/√2, (b-a)/√2).
+    Matches the Metal kernel's inline inverse rotation in shared memory.
+    """
+    d = x.shape[-1]
+    paired = x.reshape(*x.shape[:-1], d // 2, 2)
+    a = paired[..., 0]
+    b = paired[..., 1]
+    out = mx.stack([(a + b) * _SQRT2_2, (b - a) * _SQRT2_2], axis=-1)
+    return out.reshape(*x.shape)
+
+
+def _compute_codebooks(d: int = 128, bits_list=(1, 2, 3, 4)) -> dict:
+    """Solve Lloyd-Max per bit-width for the rotated coordinate distribution."""
+    from .lloyd_max import solve_lloyd_max  # local import — scipy is heavy
+    out = {}
+    for bits in bits_list:
+        centroids, _ = solve_lloyd_max(d, bits)
+        out[bits] = mx.array(centroids.numpy(), dtype=mx.float32)
+    return out
+
+
+_CODEBOOKS = _compute_codebooks()  # precomputed for d=128 (Leanstral head_dim)
+
+
+def _pack(indices: mx.array, bits: int) -> mx.array:
+    """Pack last-axis indices into uint32 words; layout matches the Metal kernels."""
+    vpw = _VALS_PER_WORD[bits]
+    d = indices.shape[-1]
+    packed_dim = (d + vpw - 1) // vpw
+    pad = packed_dim * vpw - d
+    if pad:
+        pad_widths = [(0, 0)] * (indices.ndim - 1) + [(0, pad)]
+        indices = mx.pad(indices, pad_widths)
+    grouped = indices.reshape(*indices.shape[:-1], packed_dim, vpw).astype(mx.uint32)
+    shifts = mx.arange(vpw, dtype=mx.uint32) * bits
+    return mx.sum(grouped << shifts, axis=-1)
+
+
+def _unpack(packed: mx.array, bits: int, dim: int) -> mx.array:
+    """Inverse of `_pack`. Returns (..., dim) uint32 indices."""
+    vpw = _VALS_PER_WORD[bits]
+    bit_mask = mx.array((1 << bits) - 1, dtype=mx.uint32)
+    shifts = mx.arange(vpw, dtype=mx.uint32) * bits
+    expanded = (packed[..., None] >> shifts) & bit_mask
+    flat = expanded.reshape(*expanded.shape[:-2], -1)
+    return flat[..., :dim]
+
+
+def _compress(x: mx.array, bits: int, rotate_fn, centroids: mx.array | None = None):
+    """Normalize -> rotate -> nearest-centroid -> pack.
+
+    Returns (packed: uint32 (..., packed_dim), norms: float32 (...,))
+    The convention is `centroid * norms` reconstructs the rotated component;
+    decompress then applies `unrotate_fn` to get back to the original space.
+    """
+    if centroids is None:
+        centroids = _CODEBOOKS[bits]
+    x_f = x.astype(mx.float32)
+    norms = mx.linalg.norm(x_f, axis=-1, keepdims=True)
+    x_unit = x_f / mx.maximum(norms, 1e-8)
+    rotated = rotate_fn(x_unit)
+    diffs = mx.abs(rotated[..., None] - centroids)
+    indices = mx.argmin(diffs, axis=-1).astype(mx.uint32)
+    return _pack(indices, bits), norms.squeeze(-1)
+
+
+def _decompress(packed: mx.array, norms: mx.array, dim: int, bits: int,
+                unrotate_fn, dtype=mx.float32, centroids: mx.array | None = None) -> mx.array:
+    """Reverse of `_compress`. Returns (..., dim) in original space."""
+    if centroids is None:
+        centroids = _CODEBOOKS[bits]
+    indices = _unpack(packed, bits, dim).astype(mx.int32)
+    values = centroids[indices]
+    rotated_full = values * norms[..., None]
+    return unrotate_fn(rotated_full).astype(dtype)
