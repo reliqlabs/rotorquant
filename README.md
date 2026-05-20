@@ -1,5 +1,9 @@
 # RotorQuant: KV Cache Compression for LLMs
 
+> **Fork notice (reliqlabs/rotorquant):** this fork adds **MLX / Apple Silicon
+> support for IsoQuant** plus a Modal pipeline for calibrating Leanstral-2603.
+> See [Fork additions](#fork-additions-mlx--leanstral-pipeline) at the bottom.
+
 Drop-in KV cache quantization that **bypasses the butterfly network** using block-diagonal rotations. Beats Google's TurboQuant on every axis: **better PPL, 28% faster decode, 5x faster prefill, 44x fewer parameters**.
 
 > *"Replace the d×d random orthogonal matrix with Clifford rotors... exploiting algebraic sparsity"*
@@ -229,3 +233,79 @@ python -m pytest tests/test_minimax_m2.py -v             # unit tests (no model 
 ```
 
 MIT License
+
+---
+
+## Fork additions (MLX + Leanstral pipeline)
+
+This `reliqlabs/rotorquant` fork extends upstream with **Apple Silicon
+support for IsoQuant** and a complete pipeline for calibrating a 119B-MoE
+target (Mistral's Leanstral-2603). Status: pure-MLX path validated, one
+Metal kernel landed, Modal calibration scaffolded.
+
+### What's here that upstream doesn't have
+
+| Addition | Files | Status |
+|---|---|---|
+| Pure-MLX IsoQuant pipeline | `turboquant/mlx_fused_iso_attention.py` | shipped — 29 tests, torch-parity verified |
+| PR #8 helper backfill (`_planar_rotate`, `_compress`, `_decompress`, `_CODEBOOKS`) | `turboquant/mlx_fused_planar_attention.py` | shipped — fixes upstream's broken test imports |
+| Metal kernel: inverse iso rotation (foundation for fused QK/SV) | `turboquant/mlx_fused_iso_attention.py::iso_unrotate_metal` | shipped — parity vs MLX < 1e-4 |
+| Real-model validation (Qwen 0.5B K cache) | `tools/validate_iso_on_real_model.py` | shipped — 0.93 avg cosine @ 3-bit |
+| 8-prompt Lean eval harness (mlx-lm + mlx-vlm) | `tools/lean_eval_harness.py` | shipped — pipeline wired, awaiting Leanstral runs |
+| Calibrated-rotor validator (compare vs random seed) | `tools/validate_calibrated_rotors.py` | shipped — awaiting first calibration output |
+| Modal H200 calibration app | `modal_apps/calibrate_rotorquant.py` | shipped — first prod run in flight |
+| Modal H200 FP8 baseline eval | `modal_apps/baseline_fp8_eval.py` | shipped |
+
+### Architecture: where MLX fits
+
+* **MLX** = Apple's framework, Apple Silicon only. Lets us run Leanstral
+  weight quants (Q3-Q6) on M-series Macs without an NVIDIA box.
+* **`mlx_fused_iso_attention`** mirrors PR #8's `mlx_fused_planar_attention`
+  module structure but uses 4D quaternion sandwiches instead of 2D Givens.
+  Packing format (`uint32` × `vals_per_word`) and per-token norm convention
+  are identical so existing Metal kernel infrastructure transfers cleanly.
+* **Calibration runs on Modal** (NVIDIA H200, 141 GB VRAM) because the
+  torch reference `IsoQuantMSE` needs CUDA + the 113 GB FP8 Leanstral
+  doesn't fit on consumer MacBooks. Rotor output is tiny (~50 KB) — easy
+  to download to Apple Silicon hardware for inference.
+
+### Quick smoke (any Apple Silicon)
+
+```bash
+pip install -e .
+pytest tests/test_mlx_fused_iso_attention.py  # 36 tests, ~2 s
+python tools/validate_iso_on_real_model.py \
+    mlx-community/Qwen2.5-0.5B-Instruct-4bit 3
+```
+
+Expected: ≥ 0.93 average cosine on real K vectors at 3-bit, ~4× compression.
+
+### Calibration → inference flow
+
+```
+  ┌──────────────────────────────┐         ┌────────────────────────────────┐
+  │  Modal H200 (NVIDIA)         │         │  M-series Mac (Apple Silicon)  │
+  │                              │         │                                │
+  │  modal run                   │         │  modal volume get              │
+  │    calibrate_rotorquant.py   │ rotors  │    rotors.safetensors          │
+  │                              │ ──────> │                                │
+  │  IsoQuantMSE (torch ref)     │ 50 KB   │  validate_calibrated_rotors    │
+  │  on FP8 Leanstral            │         │  iso_unrotate_metal in fused   │
+  │                              │         │    flash decode (Q5–Q6 quants) │
+  └──────────────────────────────┘         └────────────────────────────────┘
+```
+
+### Roadmap from here
+
+* [x] IsoQuant MLX primitives (rotate / unrotate / compress / decompress)
+* [x] Real-model validation on small text model
+* [x] Modal calibration + FP8 baseline app
+* [x] Metal kernel: inverse iso rotation
+* [ ] Metal kernel: fused IsoQuant QK score (using inverse rotation)
+* [ ] Metal kernel: fused IsoQuant SV accumulation
+* [ ] Metal kernel: full IsoQuant flash decode (mirror PR #8's `planar_flash_decode`)
+* [ ] mlx-vlm KV cache subclass that stores iso-packed K/V end-to-end
+* [ ] Leanstral RotorQuant runs alongside the published
+      `mvid/Leanstral-2603-MLX-{3,4,5,6}bit` weight quants
+* [ ] Eval table: PPL + Lean pass@1 across all quants × {iso3, iso4, none}
+* [ ] Upstream PR(s) for the helper backfills + MLX support (under discussion)
