@@ -35,8 +35,12 @@ def build_image() -> modal.Image:
         modal.Image.debian_slim(python_version="3.12")
         .apt_install("git")
         .pip_install([
-            # Pin transformers to a release that ships mistral4 (PR #44760).
-            "transformers>=5.8.0",
+            # Pin transformers to 5.6.0 — first release after PR #44760
+            # (Add Mistral 4, merged 2026-03-16). 5.7+ changed the
+            # Fp8Dequantize converter's expected scale-tensor shape to 2D,
+            # which is incompatible with our HF intermediate (built against
+            # the original convert PR which writes 3D scales).
+            "transformers==5.6.0",
             "torch==2.12.0",
             "torchvision",
             "huggingface_hub[hf_xet]>=0.27.0",
