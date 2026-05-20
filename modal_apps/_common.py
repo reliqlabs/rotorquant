@@ -22,8 +22,15 @@ HF_INTERMEDIATE_DIR = f"{LEANSTRAL_MODELS_PATH}/leanstral-2603-hf"
 CONSOLIDATED_DIR = f"{LEANSTRAL_MODELS_PATH}/leanstral-2603-consolidated"
 
 
+_REPO_ROOT = str(__import__("pathlib").Path(__file__).resolve().parent.parent)
+
+
 def build_image() -> modal.Image:
-    """Image carrying torch + transformers (mistral4) + our rotorquant fork."""
+    """Image carrying torch + transformers (mistral4) + our rotorquant fork.
+
+    The fork is mounted via `add_local_dir` rather than `git clone` so local
+    edits propagate without an image cache bust. Keeps iteration fast.
+    """
     return (
         modal.Image.debian_slim(python_version="3.12")
         .apt_install("git")
@@ -40,12 +47,14 @@ def build_image() -> modal.Image:
             "accelerate",  # for device_map="auto" multi-GPU loading
             "tiktoken",
         ])
-        # Bring the calibration code itself onto the image so the Modal
-        # function can `from turboquant.isoquant import IsoQuantMSE` etc.
-        .run_commands(
-            "git clone --depth 1 https://github.com/reliqlabs/rotorquant.git /opt/rotorquant"
-        )
         .env({"PYTHONPATH": "/opt/rotorquant"})
+        # Local mount: every `modal run` ships the current working tree, so
+        # bug fixes land in the next call with no rebuild needed. Excludes
+        # caches and the volumes mount points so we don't ship gigabytes.
+        .add_local_dir(
+            _REPO_ROOT, "/opt/rotorquant",
+            ignore=["__pycache__", "*.pyc", ".git", ".pytest_cache", ".mypy_cache"],
+        )
     )
 
 

@@ -115,12 +115,15 @@ class ShardedSafetensorsWriter:
 
 
 def convert_streaming(
-    input_dir: Path,
-    output_dir: Path,
+    input_dir,
+    output_dir,
     max_position_embeddings: int,
     output_format: str,
     shard_size_gb: float = 5.0,
 ):
+    # Coerce strings -> Path so callers can pass either.
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
     params = _read_json(input_dir / "params.json")
     is_vision = params.get("vision_encoder") is not None
     is_fp8_source = params.get("quantization", {}).get("qformat_weight") == "fp8_e4m3"
