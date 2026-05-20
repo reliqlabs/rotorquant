@@ -201,3 +201,61 @@ def test_fast_mode_runs_without_q_R():
     )
     assert refined["q_R"] is None
     assert refined["cos_mean"] >= baseline["cos_mean"] - 1e-4
+
+
+def test_calibration_rotors_transfer_to_mlx():
+    """Closes the calibration -> inference loop.
+
+    The full purpose of Modal calibration is: produce rotors with high cos
+    sim in torch, then deploy them to MLX inference where they should give
+    the same cos sim. If this bridge silently drifts, the entire Modal
+    spend is wasted. The existing torch-parity test uses random rotors from
+    IsoQuantMSE — it doesn't exercise the rotors that `gradient_refine_rotors`
+    actually emits. This one does.
+    """
+    mx = pytest.importorskip("mlx.core")
+    from turboquant.iso_calibrate import gradient_refine_rotors
+    from turboquant.lloyd_max import solve_lloyd_max
+    from turboquant.mlx_fused_iso_attention import iso_compress, iso_decompress
+
+    torch.manual_seed(11)
+    head_dim, bits = 128, 3
+    n_vectors = 1024
+    K = torch.randn(n_vectors, head_dim, dtype=torch.float32)
+    centroids_t, _ = solve_lloyd_max(head_dim, bits)
+    centroids = centroids_t.float()
+
+    baseline = _baseline_random_search(K, head_dim, bits, "full",
+                                       n_seeds=8, centroids=centroids)
+    refined = gradient_refine_rotors(
+        K, head_dim, bits, mode="full",
+        init={"q_L": baseline["q_L"], "q_R": baseline["q_R"]},
+        n_steps=80, lr=1e-2, n_inits=2, loss_kind="cos",
+    )
+    torch_cos = refined["cos_mean"]
+
+    # Same rotors + centroids, evaluated in MLX. The MLX path normalizes
+    # internally and stores per-token norms, so it round-trips at full
+    # magnitude — but cos sim is scale-invariant, so the two paths should
+    # agree.
+    q_L_mx = mx.array(refined["q_L"].numpy())
+    q_R_mx = mx.array(refined["q_R"].numpy())
+    centroids_mx = mx.array(centroids.numpy())
+    x_mx = mx.array(K.numpy())
+    packed, norms = iso_compress(x_mx, bits, q_L_mx, q_R_mx, centroids_mx)
+    x_hat_mx = iso_decompress(packed, norms, head_dim, bits,
+                              q_L_mx, q_R_mx, centroids_mx)
+    dot = mx.sum(x_mx * x_hat_mx, axis=-1)
+    nx = mx.linalg.norm(x_mx, axis=-1)
+    ny = mx.linalg.norm(x_hat_mx, axis=-1)
+    cos_mx = (dot / (nx * ny + 1e-8))
+    mx.eval(cos_mx)
+    mlx_cos = float(mx.mean(cos_mx).item())
+    drift = abs(mlx_cos - torch_cos)
+    print(f"  torch cos={torch_cos:.4f}  mlx cos={mlx_cos:.4f}  drift={drift:.2e}")
+    # 1e-3 catches a real bug (wrong axis/sign/convention) without flaking
+    # on fp32 rounding accumulated across rotate + quantize + unrotate.
+    assert drift < 1e-3, (
+        f"torch-MLX cos drift {drift:.3e} — calibrated rotors not "
+        f"transferring cleanly. torch={torch_cos:.4f} mlx={mlx_cos:.4f}"
+    )
