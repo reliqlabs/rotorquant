@@ -54,16 +54,26 @@ SHARED_VOLUMES = {
 
 
 _CALIB_PROMPTS = [
-    "import Mathlib\n\ntheorem add_comm_nat (a b : Nat) : a + b = b + a := by",
-    "import Mathlib\n\ntheorem zero_le (n : Nat) : 0 ≤ n := by",
-    "Solve the integral ∫ sin(x) cos(x) dx step by step, using substitution.",
-    "Explain the relationship between continuous functions and limits using ε-δ.",
-    "def fibonacci : Nat → Nat\n  | 0 => 0\n  | 1 => 1\n  | n + 2 =>",
-    "Prove that the set of rational numbers is countable.",
-    "What is the cardinality of the continuum, and how does Cantor's diagonal argument prove it differs from countable infinity?",
-    "Lean 4 tactic: `simp` rewrites using a database of lemmas. Explain its strategy.",
-    "Implement merge sort in pseudocode, then state its worst-case complexity.",
-    "Define a category-theoretic functor and give an example from topology.",
+    # Lean 4 proof tactics — domain-specific, our primary target.
+    "import Mathlib\nimport Mathlib.Tactic\n\ntheorem add_comm_nat (a b : Nat) : a + b = b + a := by\n  induction a with\n  | zero => simp\n  | succ a ih => rw [Nat.succ_add, ih, Nat.add_succ]",
+    "import Mathlib\n\ntheorem zero_le (n : Nat) : 0 ≤ n := by\n  induction n with\n  | zero => exact Nat.le_refl 0\n  | succ n ih => exact Nat.le_succ_of_le ih",
+    "import Mathlib\n\ntheorem mul_zero_eq_zero (n : Nat) : n * 0 = 0 := by rfl\n\ntheorem zero_mul_eq_zero (n : Nat) : 0 * n = 0 := by\n  induction n with\n  | zero => rfl\n  | succ n ih => rw [Nat.mul_succ, ih, Nat.add_zero]",
+    "import Mathlib.Data.List.Basic\n\ntheorem length_append (xs ys : List α) : (xs ++ ys).length = xs.length + ys.length := by\n  induction xs with\n  | nil => simp\n  | cons x xs ih => simp [List.cons_append, List.length_cons, ih, Nat.succ_add]",
+    "import Mathlib.Topology.Basic\n\nexample {X Y : Type*} [TopologicalSpace X] [TopologicalSpace Y]\n    (f : X → Y) (hf : Continuous f) (U : Set Y) (hU : IsOpen U) :\n    IsOpen (f ⁻¹' U) := hf.isOpen_preimage U hU",
+    "import Mathlib.Analysis.Calculus.Deriv.Basic\n\nexample : deriv (fun x => x^2) = (fun x => 2*x) := by\n  ext x\n  simp [deriv_pow]",
+    # Math prose for distributional coverage.
+    "Solve the integral ∫ sin(x) cos(x) dx using the substitution u = sin(x), du = cos(x) dx, giving ∫ u du = u²/2 + C = sin²(x)/2 + C.",
+    "The ε-δ definition of a limit states that limₓ→a f(x) = L iff for every ε > 0 there exists δ > 0 such that |x - a| < δ implies |f(x) - L| < ε. Continuity at a means this limit equals f(a).",
+    "Cantor's diagonal argument shows that the set of reals in [0, 1] is uncountable. Assume a bijection f : ℕ → [0, 1] exists; construct a real r whose nth digit differs from f(n)'s nth digit. Then r is not in the image, contradicting surjectivity.",
+    "The cardinality of the continuum c = 2^ℵ₀. The continuum hypothesis asks whether ℵ₁ = c; it is independent of ZFC.",
+    # Code / general English.
+    "def fibonacci(n: int) -> int:\n    if n < 2:\n        return n\n    a, b = 0, 1\n    for _ in range(n - 1):\n        a, b = b, a + b\n    return b",
+    "Merge sort recursively splits an array of length n into halves, sorts each, then merges in O(n) time. Total complexity T(n) = 2 T(n/2) + Θ(n) = Θ(n log n). Stable and not in-place by default.",
+    "A category C consists of objects and morphisms (arrows) between them, with composition and identities satisfying associativity and unit laws. A functor F : C → D maps objects to objects and morphisms to morphisms preserving composition: F(g ∘ f) = F(g) ∘ F(f).",
+    # More dense math text to extend the corpus.
+    "The Riemann zeta function ζ(s) = Σ_{n=1}^∞ 1/n^s converges for Re(s) > 1 and has analytic continuation to ℂ \\ {1}. Its non-trivial zeros all lie on Re(s) = 1/2 by the Riemann hypothesis.",
+    "In linear algebra, the singular value decomposition factorizes any m×n matrix A as U Σ V^T where U and V are orthogonal and Σ is diagonal with non-negative singular values. Used for PCA, low-rank approximation, and pseudo-inverses.",
+    "Bayes' theorem: P(A|B) = P(B|A) P(A) / P(B). Updates belief in A given new evidence B. Foundation of Bayesian inference and used throughout statistics, machine learning, and decision theory.",
 ]
 
 
