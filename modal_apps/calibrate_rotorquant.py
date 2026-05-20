@@ -393,102 +393,22 @@ def _quat_mul_torch(a, b):
 
 
 def _gradient_refine_rotors(K, head_dim: int, bits: int, mode: str,
-                            init: dict, n_steps: int = 300, lr: float = 1e-2) -> dict:
-    """Refine rotor parameters with Adam on the reconstruction MSE.
-
-    Uses a straight-through estimator on the argmin quantize step: forward is
-    the hard nearest-centroid lookup, backward treats it as identity. Lets
-    gradient flow into the quaternion parameters.
-
-    init: dict with `q_L` (n_groups, 4) tensor and (for mode='full') `q_R`.
-        Typically the best rotors from `_random_rotor_search`.
-
-    Returns the same dict shape as the random search result, refined.
+                            init: dict, n_steps: int = 300, lr: float = 1e-2,
+                            n_inits: int = 8) -> dict:
+    """Multi-start gradient refinement via the shared turboquant.iso_calibrate
+    module. The single-source-of-truth implementation lives there so it can be
+    unit-tested locally (no Modal needed). See:
+        turboquant/iso_calibrate.py::gradient_refine_rotors
+        tests/test_iso_calibrate.py
     """
-    import torch
-    from turboquant.isoquant import IsoQuantMSE
-
-    # Use CUDA if available — K is already on GPU from the model's cache.
-    device = K.device
-    K = K.to(torch.float32)
-    norms = K.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-    K_unit = K / norms
-    n_groups = head_dim // 4
-
-    # Reshape K_unit into (N, n_groups, 4) quaternion blocks.
-    K_blocks = K_unit.view(K_unit.shape[0], n_groups, 4)
-
-    # Lloyd-Max centroids (computed once, reused).
-    iso_seed = IsoQuantMSE(head_dim, bits, mode=mode, seed=0, device="cpu")
-    centroids = iso_seed.centroids.to(device)
-
-    q_L = init["q_L"].to(device).clone().detach().requires_grad_(True)
-    params = [q_L]
-    if mode == "full":
-        q_R = init["q_R"].to(device).clone().detach().requires_grad_(True)
-        params.append(q_R)
-    else:
-        q_R = None
-
-    opt = torch.optim.Adam(params, lr=lr)
-
-    def _iso_forward(K_blocks):
-        # rotate: q_L * v * conj(q_R)  (broadcast q_L over batch via slicing)
-        qL = q_L.unsqueeze(0)
-        tmp = _quat_mul_torch(qL, K_blocks)
-        if mode == "full":
-            qR_conj = _quat_conj_torch(q_R).unsqueeze(0)
-            rot = _quat_mul_torch(tmp, qR_conj)
-        else:
-            rot = tmp
-        # Scalar Lloyd-Max with STE.
-        flat = rot.reshape(rot.shape[0], -1)  # (N, n_groups*4)
-        # Nearest centroid (hard, no grad).
-        diffs = (flat.unsqueeze(-1) - centroids).abs()  # (N, d, K)
-        idx = diffs.argmin(dim=-1)
-        hard = centroids[idx]
-        # STE: forward hard, backward as identity.
-        q_flat = flat + (hard - flat).detach()
-        q_blocks = q_flat.view(rot.shape)
-        # inverse rotate
-        if mode == "full":
-            tmp2 = _quat_mul_torch(_quat_conj_torch(q_L).unsqueeze(0), q_blocks)
-            recon = _quat_mul_torch(tmp2, q_R.unsqueeze(0))
-        else:
-            recon = _quat_mul_torch(_quat_conj_torch(q_L).unsqueeze(0), q_blocks)
-        return recon.reshape(recon.shape[0], -1)
-
-    for step in range(n_steps):
-        opt.zero_grad()
-        K_hat_unit = _iso_forward(K_blocks)
-        loss = (K_unit - K_hat_unit).pow(2).mean()
-        loss.backward()
-        opt.step()
-        # Project quaternions back to unit norm.
-        with torch.no_grad():
-            q_L.div_(q_L.norm(dim=-1, keepdim=True).clamp(min=1e-8))
-            if mode == "full":
-                q_R.div_(q_R.norm(dim=-1, keepdim=True).clamp(min=1e-8))
-
-    # Final evaluation in float32.
-    with torch.no_grad():
-        K_hat_unit = _iso_forward(K_blocks)
-        K_hat = K_hat_unit * norms
-        nx = K.norm(dim=-1).clamp(min=1e-8)
-        ny = K_hat.norm(dim=-1).clamp(min=1e-8)
-        cos = (K * K_hat).sum(dim=-1) / (nx * ny)
-        mse = (K - K_hat).pow(2).mean().item()
-        cos_mean = cos.mean().item()
-        cos_p05 = cos.quantile(0.05).item()
-
-    return {
-        "seed": init.get("seed", -1),  # carried over for telemetry
-        "mse": mse,
-        "cos_mean": cos_mean,
-        "cos_p05": cos_p05,
-        "q_L": q_L.detach().cpu().clone(),
-        "q_R": (q_R.detach().cpu().clone() if mode == "full" else None),
-    }
+    from turboquant.iso_calibrate import gradient_refine_rotors
+    result = gradient_refine_rotors(
+        K, head_dim, bits, mode=mode, init=init,
+        n_steps=n_steps, lr=lr, n_inits=n_inits,
+        loss_kind="cos", forward_kind="soft", soft_temperature=0.05,
+    )
+    result["seed"] = init.get("seed", -1)
+    return result
 
 
 @app.local_entrypoint()
