@@ -90,6 +90,9 @@ def calibrate(
     calib_tokens: int = 4096,
     capture_layers: Optional[str] = None,
     output_tag: str = "default",
+    optimize: str = "random",
+    grad_steps: int = 300,
+    grad_lr: float = 1e-2,
 ):
     """Capture K activations + search for low-error rotor seeds per layer.
 
@@ -101,6 +104,12 @@ def calibrate(
         capture_layers: comma-separated layer indices, e.g. "0,8,17,26,35"
                         (default: every 4th layer to cap memory)
         output_tag: subdir under /mnt/calibration/iso/ to write into
+        optimize: 'random' (n_rotor_seeds tries), or 'gradient' (Adam-refine
+            the best random seed via straight-through estimator on the argmin
+            quantize). Gradient is ~30s/layer extra and typically lifts cos
+            sim by 0.01-0.02.
+        grad_steps: Adam iterations per layer when optimize='gradient'.
+        grad_lr: Adam learning rate on rotor params.
     """
     import sys
     sys.path.insert(0, "/opt/rotorquant")
@@ -210,11 +219,29 @@ def calibrate(
     os.makedirs(out_dir, exist_ok=True)
     summary: dict[str, dict] = {}
     rotor_state: dict[str, torch.Tensor] = {}
+    # If gradient-refining, do it on GPU (K is on cpu after the model forward
+    # but moving back to cuda is cheap — 31k vectors × 128 fp32 = ~16 MB).
+    grad_device = None
+    if optimize == "gradient":
+        import torch
+        grad_device = (torch.device("cuda")
+                       if torch.cuda.is_available() else torch.device("cpu"))
+
     for li in layer_ids:
         if li not in captured:
             continue
         K = captured[li]  # already (N, head_dim) fp32 on cpu
         best = _random_rotor_search(K, head_dim, bits, mode, n_rotor_seeds)
+        if optimize == "gradient":
+            K_gpu = K.to(grad_device)
+            refined = _gradient_refine_rotors(
+                K_gpu, head_dim, bits, mode, init=best,
+                n_steps=grad_steps, lr=grad_lr,
+            )
+            if refined["cos_mean"] >= best["cos_mean"]:
+                best = refined
+                print(f"[calib]   layer {li}: gradient refine lift "
+                      f"{best['cos_mean'] - refined['cos_mean']:+.4f} (kept)", flush=True)
         rotor_state[f"layer_{li}.q_L"] = best["q_L"]
         if mode == "full":
             rotor_state[f"layer_{li}.q_R"] = best["q_R"]
@@ -347,6 +374,123 @@ def _random_rotor_search(K, head_dim: int, bits: int, mode: str, n_seeds: int) -
     return best
 
 
+def _quat_conj_torch(q):
+    """Quaternion conjugate (w, -x, -y, -z) using torch."""
+    import torch
+    return q * torch.tensor([1.0, -1.0, -1.0, -1.0], device=q.device, dtype=q.dtype)
+
+
+def _quat_mul_torch(a, b):
+    """Hamilton product of two quaternion tensors (..., 4)."""
+    import torch
+    aw, ax, ay, az = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    bw, bx, by, bz = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+    rw = aw * bw - ax * bx - ay * by - az * bz
+    rx = aw * bx + ax * bw + ay * bz - az * by
+    ry = aw * by - ax * bz + ay * bw + az * bx
+    rz = aw * bz + ax * by - ay * bx + az * bw
+    return torch.stack([rw, rx, ry, rz], dim=-1)
+
+
+def _gradient_refine_rotors(K, head_dim: int, bits: int, mode: str,
+                            init: dict, n_steps: int = 300, lr: float = 1e-2) -> dict:
+    """Refine rotor parameters with Adam on the reconstruction MSE.
+
+    Uses a straight-through estimator on the argmin quantize step: forward is
+    the hard nearest-centroid lookup, backward treats it as identity. Lets
+    gradient flow into the quaternion parameters.
+
+    init: dict with `q_L` (n_groups, 4) tensor and (for mode='full') `q_R`.
+        Typically the best rotors from `_random_rotor_search`.
+
+    Returns the same dict shape as the random search result, refined.
+    """
+    import torch
+    from turboquant.isoquant import IsoQuantMSE
+
+    # Use CUDA if available — K is already on GPU from the model's cache.
+    device = K.device
+    K = K.to(torch.float32)
+    norms = K.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    K_unit = K / norms
+    n_groups = head_dim // 4
+
+    # Reshape K_unit into (N, n_groups, 4) quaternion blocks.
+    K_blocks = K_unit.view(K_unit.shape[0], n_groups, 4)
+
+    # Lloyd-Max centroids (computed once, reused).
+    iso_seed = IsoQuantMSE(head_dim, bits, mode=mode, seed=0, device="cpu")
+    centroids = iso_seed.centroids.to(device)
+
+    q_L = init["q_L"].to(device).clone().detach().requires_grad_(True)
+    params = [q_L]
+    if mode == "full":
+        q_R = init["q_R"].to(device).clone().detach().requires_grad_(True)
+        params.append(q_R)
+    else:
+        q_R = None
+
+    opt = torch.optim.Adam(params, lr=lr)
+
+    def _iso_forward(K_blocks):
+        # rotate: q_L * v * conj(q_R)  (broadcast q_L over batch via slicing)
+        qL = q_L.unsqueeze(0)
+        tmp = _quat_mul_torch(qL, K_blocks)
+        if mode == "full":
+            qR_conj = _quat_conj_torch(q_R).unsqueeze(0)
+            rot = _quat_mul_torch(tmp, qR_conj)
+        else:
+            rot = tmp
+        # Scalar Lloyd-Max with STE.
+        flat = rot.reshape(rot.shape[0], -1)  # (N, n_groups*4)
+        # Nearest centroid (hard, no grad).
+        diffs = (flat.unsqueeze(-1) - centroids).abs()  # (N, d, K)
+        idx = diffs.argmin(dim=-1)
+        hard = centroids[idx]
+        # STE: forward hard, backward as identity.
+        q_flat = flat + (hard - flat).detach()
+        q_blocks = q_flat.view(rot.shape)
+        # inverse rotate
+        if mode == "full":
+            tmp2 = _quat_mul_torch(_quat_conj_torch(q_L).unsqueeze(0), q_blocks)
+            recon = _quat_mul_torch(tmp2, q_R.unsqueeze(0))
+        else:
+            recon = _quat_mul_torch(_quat_conj_torch(q_L).unsqueeze(0), q_blocks)
+        return recon.reshape(recon.shape[0], -1)
+
+    for step in range(n_steps):
+        opt.zero_grad()
+        K_hat_unit = _iso_forward(K_blocks)
+        loss = (K_unit - K_hat_unit).pow(2).mean()
+        loss.backward()
+        opt.step()
+        # Project quaternions back to unit norm.
+        with torch.no_grad():
+            q_L.div_(q_L.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+            if mode == "full":
+                q_R.div_(q_R.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+
+    # Final evaluation in float32.
+    with torch.no_grad():
+        K_hat_unit = _iso_forward(K_blocks)
+        K_hat = K_hat_unit * norms
+        nx = K.norm(dim=-1).clamp(min=1e-8)
+        ny = K_hat.norm(dim=-1).clamp(min=1e-8)
+        cos = (K * K_hat).sum(dim=-1) / (nx * ny)
+        mse = (K - K_hat).pow(2).mean().item()
+        cos_mean = cos.mean().item()
+        cos_p05 = cos.quantile(0.05).item()
+
+    return {
+        "seed": init.get("seed", -1),  # carried over for telemetry
+        "mse": mse,
+        "cos_mean": cos_mean,
+        "cos_p05": cos_p05,
+        "q_L": q_L.detach().cpu().clone(),
+        "q_R": (q_R.detach().cpu().clone() if mode == "full" else None),
+    }
+
+
 @app.local_entrypoint()
 def main(
     bits: int = 3,
@@ -355,6 +499,9 @@ def main(
     calib_tokens: int = 4096,
     capture_layers: str = "",
     output_tag: str = "default",
+    optimize: str = "random",
+    grad_steps: int = 300,
+    grad_lr: float = 1e-2,
 ):
     result = calibrate.remote(
         bits=bits,
@@ -363,6 +510,9 @@ def main(
         calib_tokens=calib_tokens,
         capture_layers=capture_layers or None,
         output_tag=output_tag,
+        optimize=optimize,
+        grad_steps=grad_steps,
+        grad_lr=grad_lr,
     )
     print("---- calibration summary ----")
     print(json.dumps(result["summary"], indent=2))
