@@ -96,7 +96,7 @@ def calibrate(
     import numpy as np
     import torch
     from safetensors.torch import save_file
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModel, AutoTokenizer
 
     from turboquant.isoquant import IsoQuantMSE, make_random_unit_quaternion
 
@@ -108,12 +108,24 @@ def calibrate(
     print(f"[calib] loading {HF_INTERMEDIATE_DIR}", flush=True)
     t0 = time.time()
     tokenizer = AutoTokenizer.from_pretrained(HF_INTERMEDIATE_DIR)
-    model = AutoModelForCausalLM.from_pretrained(
-        HF_INTERMEDIATE_DIR,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=False,
-    )
+    # Leanstral is mistral3 (multimodal wrapper) when vision is present.
+    # AutoModelForCausalLM doesn't know about it; use the generic AutoModel
+    # which routes via _model_mapping to Mistral3ForConditionalGeneration.
+    cfg = AutoConfig.from_pretrained(HF_INTERMEDIATE_DIR)
+    if cfg.model_type == "mistral3":
+        from transformers import Mistral3ForConditionalGeneration
+        model = Mistral3ForConditionalGeneration.from_pretrained(
+            HF_INTERMEDIATE_DIR,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+    else:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(
+            HF_INTERMEDIATE_DIR,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
     model.eval()
     print(f"[calib] load() in {time.time() - t0:.1f}s", flush=True)
 

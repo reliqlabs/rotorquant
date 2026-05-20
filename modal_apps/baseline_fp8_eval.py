@@ -105,18 +105,28 @@ def run_eval(max_tokens: int = 256, output_tag: str = "fp8-baseline") -> dict:
     sys.path.insert(0, "/opt/rotorquant")
 
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
 
     prepare_hf_intermediate_if_missing()
 
     print(f"[eval] loading {HF_INTERMEDIATE_DIR}", flush=True)
     t0 = time.time()
     tokenizer = AutoTokenizer.from_pretrained(HF_INTERMEDIATE_DIR)
-    model = AutoModelForCausalLM.from_pretrained(
-        HF_INTERMEDIATE_DIR,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
+    cfg = AutoConfig.from_pretrained(HF_INTERMEDIATE_DIR)
+    if cfg.model_type == "mistral3":
+        from transformers import Mistral3ForConditionalGeneration
+        model = Mistral3ForConditionalGeneration.from_pretrained(
+            HF_INTERMEDIATE_DIR,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+    else:
+        from transformers import AutoModelForCausalLM
+        model = AutoModelForCausalLM.from_pretrained(
+            HF_INTERMEDIATE_DIR,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
     model.eval()
     print(f"[eval] load() in {time.time() - t0:.1f}s", flush=True)
 
