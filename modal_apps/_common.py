@@ -83,16 +83,22 @@ def prepare_hf_intermediate_if_missing():
 
     # Run the streaming converter we wrote (committed in the fork).
     print(f"[prep] running streaming consolidated → HF converter")
-    sys.path.insert(0, "/opt/rotorquant/tools")  # if we put it there later
-    # The converter lives in /tmp/lean-convert/ locally; for Modal we ship a
-    # copy alongside the modal_apps tree.
     from modal_apps._convert_streaming import convert_streaming  # type: ignore
+    from modal_apps._convert_mistral4_weight_to_hf import (  # type: ignore
+        convert_and_write_processor_and_tokenizer,
+    )
 
-    convert_streaming(
+    config = convert_streaming(
         input_dir=CONSOLIDATED_DIR,
         output_dir=HF_INTERMEDIATE_DIR,
         max_position_embeddings=1_048_576,
         output_format="fp8",
         shard_size_gb=5.0,
+    )
+    # The streaming variant only writes weights + config; the tokenizer and
+    # processor writing lived in the original main() entry. Call it manually.
+    from pathlib import Path as _Path
+    convert_and_write_processor_and_tokenizer(
+        _Path(CONSOLIDATED_DIR), _Path(HF_INTERMEDIATE_DIR), config,
     )
     print(f"[prep] done, HF intermediate at {HF_INTERMEDIATE_DIR}")
