@@ -44,6 +44,13 @@ class IsoKVCache:
             the precomputed d=128 grid; pass a per-d grid for other head_dims).
     """
 
+    # Class-level sentinel so `hasattr(cache, "bits")` is False — mlx-lm's
+    # SDPA uses that as a "this is a quantized cache" signal and would route
+    # us to its quantize_matmul path, which expects packed format. Our cache
+    # already decompresses to full precision in update_and_fetch.
+    # Keep the user-facing API as `iso_bits` to avoid the collision.
+    iso_bits: int
+
     def __init__(
         self,
         bits: int,
@@ -52,7 +59,7 @@ class IsoKVCache:
         head_dim: int,
         centroids: Optional[mx.array] = None,
     ):
-        self.bits = bits
+        self.iso_bits = bits
         self.q_L = q_L
         self.q_R = q_R
         self.head_dim = head_dim
@@ -95,7 +102,7 @@ class IsoKVCache:
         """K shape: (B, H, T, D) -> (packed (B, H, T, packed_dim), norms (B, H, T))."""
         B, H, T, D = K.shape
         flat = K.reshape(-1, D)
-        packed, norms = iso_compress(flat, self.bits, self.q_L, self.q_R, self.centroids)
+        packed, norms = iso_compress(flat, self.iso_bits, self.q_L, self.q_R, self.centroids)
         packed_dim = packed.shape[-1]
         return packed.reshape(B, H, T, packed_dim), norms.reshape(B, H, T)
 
@@ -111,7 +118,7 @@ class IsoKVCache:
         flat_packed = packed.reshape(-1, packed.shape[-1])
         flat_norms = norms.reshape(-1)
         flat_out = iso_decompress(
-            flat_packed, flat_norms, self.head_dim, self.bits,
+            flat_packed, flat_norms, self.head_dim, self.iso_bits,
             self.q_L, self.q_R, self.centroids,
         )
         return flat_out.reshape(B, H, T, self.head_dim)
