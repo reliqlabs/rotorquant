@@ -25,6 +25,7 @@ from .mlx_fused_iso_attention import (
     compute_codebooks,
     iso_compress,
     iso_decompress,
+    iso_flash_decode,
 )
 
 
@@ -153,6 +154,40 @@ class IsoKVCache:
         return (
             self.k_packed.nbytes + self.k_norms.nbytes
             + self.v_packed.nbytes + self.v_norms.nbytes
+        )
+
+    def attend(self, query: mx.array, scale: float) -> mx.array:
+        """Compute scaled-dot-product attention directly against the packed
+        cache via the fused Metal kernel — no decompression detour.
+
+        Bypasses the `decompress -> mx.fast.scaled_dot_product_attention`
+        path that `update_and_fetch` returns, taking the ~8-13x speedup
+        documented in the README at T >= 1024. Use this in custom attention
+        layers when you control the SDPA call site; the standard mlx-lm
+        attention will route through update_and_fetch + SDPA instead, which
+        still works but pays the decompression cost.
+
+        Args:
+            query: (B, H, 1, head_dim) — current decode-step query.
+            scale: softmax temperature (1/sqrt(head_dim) typically).
+
+        Returns:
+            (B, H, 1, head_dim) attention output.
+        """
+        if self.k_packed is None:
+            raise RuntimeError("IsoKVCache.attend called before update_and_fetch")
+        return iso_flash_decode(
+            query=query,
+            k_packed=self.k_packed,
+            k_norms=self.k_norms,
+            v_packed=self.v_packed,
+            v_norms=self.v_norms,
+            centroids=self.centroids,
+            q_L=self.q_L,
+            q_R=self.q_R,
+            scale=scale,
+            dim=self.head_dim,
+            bits=self.iso_bits,
         )
 
 

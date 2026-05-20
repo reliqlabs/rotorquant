@@ -85,6 +85,33 @@ def test_memory_savings():
     assert ratio > 3.0, f"compression ratio {ratio:.2f}× below 3× — packing broken?"
 
 
+def test_attend_matches_decompress_sdpa():
+    """`IsoKVCache.attend` must match SDPA against the decompressed cache."""
+    import math
+    cache = _make_cache(head_dim=128, bits=3)
+    mx.random.seed(99)
+    K = mx.random.normal((1, 4, 64, 128))
+    V = mx.random.normal((1, 4, 64, 128))
+    cache.update_and_fetch(K, V)
+
+    q = mx.random.normal((1, 4, 1, 128))
+    scale = 1.0 / math.sqrt(128)
+
+    K_dec, V_dec = cache.state
+    ref = mx.fast.scaled_dot_product_attention(q, K_dec, V_dec, scale=scale)
+    fused = cache.attend(q, scale)
+    mx.eval(ref, fused)
+    diff = mx.max(mx.abs(ref - fused)).item()
+    assert diff < 5e-3, f"attend vs SDPA diff={diff:.3e}"
+
+
+def test_attend_raises_before_update():
+    cache = _make_cache(head_dim=128, bits=3)
+    q = mx.random.normal((1, 4, 1, 128))
+    with pytest.raises(RuntimeError, match="before update_and_fetch"):
+        cache.attend(q, 1.0)
+
+
 def test_load_rotors_factory(tmp_path):
     """Round-trip rotors.safetensors -> factory -> per-layer cache."""
     import os
