@@ -168,29 +168,18 @@ def calibrate(
         out = model(input_ids, use_cache=True, return_dict=True)
     past_kv = out.past_key_values
     print(f"[calib] forward pass in {time.time() - t1:.1f}s", flush=True)
-    # Introspect the cache once so we know what we're dealing with for MLA.
-    print(f"[calib] past_kv type: {type(past_kv).__name__}", flush=True)
-    print(f"[calib] past_kv attrs: {sorted(a for a in dir(past_kv) if not a.startswith('_'))}",
-          flush=True)
-    if hasattr(past_kv, "key_cache"):
-        kc = past_kv.key_cache
-        kc_len = len(kc) if hasattr(kc, "__len__") else "?"
-        print(f"[calib] past_kv.key_cache len={kc_len}", flush=True)
-        for li in (0, len(kc) - 1) if hasattr(kc, "__len__") else ():
-            entry = kc[li] if li < len(kc) else None
-            print(f"[calib]   key_cache[{li}]: {type(entry).__name__} "
-                  f"shape={getattr(entry, 'shape', None)}", flush=True)
-    # Mistral4 uses MLA — likely a DynamicMLACache with k_nope_cache, k_pe_cache,
-    # value_cache, or a single compressed kv_cache.
-    for attr in ("k_nope_cache", "k_pe_cache", "compressed_kv_cache",
-                 "kv_a_cache", "kv_b_cache", "value_cache"):
-        if hasattr(past_kv, attr):
-            v = getattr(past_kv, attr)
-            v_len = len(v) if hasattr(v, "__len__") else "?"
-            print(f"[calib] past_kv.{attr}: len={v_len}", flush=True)
-            if hasattr(v, "__len__") and len(v) > 0:
-                print(f"[calib]   {attr}[0]: {type(v[0]).__name__} "
-                      f"shape={getattr(v[0], 'shape', None)}", flush=True)
+    # One-shot diagnostic of layer-cache attrs to confirm we're reading the right field.
+    if hasattr(past_kv, "layers") and len(past_kv.layers) > 0:
+        layer0 = past_kv.layers[0]
+        layer0_attrs = sorted(a for a in dir(layer0) if not a.startswith("_"))
+        print(f"[calib] past_kv.layers[0] type: {type(layer0).__name__}", flush=True)
+        print(f"[calib] past_kv.layers[0] attrs: {layer0_attrs}", flush=True)
+        for attr in ("keys", "key_states", "key_cache", "k"):
+            v = getattr(layer0, attr, None)
+            if v is not None:
+                print(f"[calib] layers[0].{attr}: shape={getattr(v, 'shape', None)}",
+                      flush=True)
+                break
 
     # past_kv may be a DynamicCache or a list-of-tuples depending on transformers
     # version. Normalize to a list of K tensors per layer.
@@ -291,14 +280,26 @@ def _find_attention(layer):
 
 
 def _extract_k_for_layer(past_kv, layer_idx: int):
-    """Pull layer_idx's K tensor out of whatever cache type transformers gave us."""
-    # Transformers 5.x DynamicCache exposes `.key_cache` (list of tensors).
+    """Pull layer_idx's K tensor out of whatever cache transformers gave us.
+
+    Supports three layouts:
+      - transformers 5.6+ DynamicCache: `past_kv.layers[i]` is a KVCacheLayer
+        with `.keys` (preferred) or `.key_cache`.
+      - transformers 5.x older DynamicCache: `past_kv.key_cache` is a list.
+      - Legacy tuple-of-tuples format.
+    """
+    if hasattr(past_kv, "layers"):
+        layers = past_kv.layers
+        if layer_idx < len(layers):
+            layer = layers[layer_idx]
+            for attr in ("keys", "key_states", "key_cache", "k"):
+                v = getattr(layer, attr, None)
+                if v is not None:
+                    return v
     if hasattr(past_kv, "key_cache"):
         kc = past_kv.key_cache
         if layer_idx < len(kc) and kc[layer_idx] is not None:
             return kc[layer_idx]
-        return None
-    # Older format: tuple of (k, v) per layer.
     if isinstance(past_kv, (tuple, list)) and layer_idx < len(past_kv):
         entry = past_kv[layer_idx]
         if isinstance(entry, (tuple, list)) and len(entry) >= 1:
