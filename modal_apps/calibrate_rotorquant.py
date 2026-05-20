@@ -40,10 +40,12 @@ from modal_apps._common import (
 
 app = modal.App("leanstral-calibrate", image=build_image())
 
-# H200 has 141 GB VRAM — enough for the 113 GB FP8 model + activations + KV
-# cache. If H200 isn't available, fall back to H100:2 (160 GB combined) with
-# device_map="auto".
-GPU = "H200"
+# Leanstral dequantized to bf16 is ~238 GB. H100:3 (240 GB combined) is the
+# smallest configuration that fits in pure VRAM with device_map="auto". H200
+# alone (141 GB) requires CPU offload via accelerate, which makes calibration
+# prohibitively slow.
+# Going with H100:3 — predictable cost, no offload pauses.
+GPU = "H100:3"
 TIMEOUT_S = 4 * 60 * 60  # 4 hours max: first-run conversion + calibration
 SHARED_VOLUMES = {
     LEANSTRAL_MODELS_PATH: LEANSTRAL_MODELS_VOL,
@@ -234,15 +236,20 @@ def _coerce_activation_scheme_to_dynamic(cfg):
     """Mutate cfg.quantization_config so the MoE forward picks the eager path.
 
     Handles both the dict and FP8Config object shapes that transformers may
-    surface depending on version.
+    surface depending on version. Also flips dequantize=True so transformers
+    expands FP8 → bf16 at load time, bypassing the kernels-community Triton
+    kernels entirely — those kernels have a shape-mismatch bug with the
+    current transformers version on the grouped_mm experts path.
     """
     qc = getattr(cfg, "quantization_config", None)
     if qc is None:
         return
     if hasattr(qc, "activation_scheme"):
         qc.activation_scheme = "dynamic"
+        qc.dequantize = True
     elif isinstance(qc, dict):
         qc["activation_scheme"] = "dynamic"
+        qc["dequantize"] = True
 
 
 def _find_decoder_layers(model):
