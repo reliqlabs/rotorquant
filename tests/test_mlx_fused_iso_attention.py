@@ -377,3 +377,128 @@ def test_iso_flash_decode_matches_reference(mode, bits, T):
     # Looser tolerance — flash decode runs an online softmax across tiles
     # which accumulates a bit more rounding than a one-shot softmax.
     assert diff < 5e-3, f"flash decode vs ref diff={diff:.3e}  (mode={mode}, bits={bits}, T={T})"
+
+
+# ── Sparse two-pass attention (iso phase1 + phase2) ────────────────────────
+
+
+@pytest.mark.parametrize("mode", ["full", "fast"])
+@pytest.mark.parametrize("bits", [3])
+@pytest.mark.parametrize("T", [64, 300])
+def test_iso_sparse_attend_topk_equals_seqlen_matches_flash(mode, bits, T):
+    """When topk >= T, no tokens get masked — sparse output should equal
+    iso_flash_decode bit-for-bit (modulo fp32 rounding from the threshold
+    branch). Catches sign/index/qrot bugs in the sparse path that would
+    otherwise hide behind 'maybe topk=64 selected the wrong tokens'."""
+    import math
+    from turboquant.mlx_fused_iso_attention import (
+        iso_compress, iso_flash_decode, iso_fused_sparse_attend,
+        make_random_quaternions, _ISO_CODEBOOKS,
+    )
+    mx.random.seed(0)
+    B, H, D = 1, 2, 128
+    q_L = make_random_quaternions(D // 4, seed=11)
+    q_R = make_random_quaternions(D // 4, seed=12) if mode == "full" else None
+    centroids = _ISO_CODEBOOKS[bits]
+
+    K = mx.random.normal((B * H * T, D)).astype(mx.float32)
+    V = mx.random.normal((B * H * T, D)).astype(mx.float32)
+    k_packed_flat, k_norms_flat = iso_compress(K, bits, q_L, q_R, centroids)
+    v_packed_flat, v_norms_flat = iso_compress(V, bits, q_L, q_R, centroids)
+    k_packed = k_packed_flat.reshape(B, H, T, -1)
+    k_norms = k_norms_flat.reshape(B, H, T)
+    v_packed = v_packed_flat.reshape(B, H, T, -1)
+    v_norms = v_norms_flat.reshape(B, H, T)
+
+    q = mx.random.normal((B, H, 1, D)).astype(mx.float32)
+    scale = 1.0 / math.sqrt(D)
+
+    dense = iso_flash_decode(q, k_packed, k_norms, v_packed, v_norms,
+                             centroids, q_L, q_R, scale, D, bits)
+    sparse = iso_fused_sparse_attend(q, k_packed, k_norms, v_packed, v_norms,
+                                     centroids, q_L, q_R, scale, D, bits,
+                                     topk=T + 1024)  # > T → keep all
+    mx.eval(dense, sparse)
+    diff = mx.max(mx.abs(dense - sparse)).item()
+    assert diff < 5e-3, (
+        f"sparse(topk>=T) vs dense flash diff={diff:.3e} "
+        f"(mode={mode}, bits={bits}, T={T})"
+    )
+
+
+def test_iso_sparse_attend_topk_one_picks_top_token():
+    """With topk=1 the output should equal V[argmax score] (decompressed),
+    up to softmax temperature → 0 collapsing to one-hot. We test by
+    forging a query that strongly aligns with one synthetic K vector."""
+    import math
+    from turboquant.mlx_fused_iso_attention import (
+        iso_compress, iso_decompress, iso_fused_sparse_attend,
+        make_random_quaternions, _ISO_CODEBOOKS,
+    )
+    mx.random.seed(1)
+    B, H, D, T = 1, 1, 128, 256
+    bits, mode = 3, "full"
+    q_L = make_random_quaternions(D // 4, seed=21)
+    q_R = make_random_quaternions(D // 4, seed=22)
+    centroids = _ISO_CODEBOOKS[bits]
+
+    # All K small + noisy, but one K dominates so QK strongly selects it.
+    K = mx.random.normal((B * H * T, D)).astype(mx.float32) * 0.01
+    target = 137
+    dominant = mx.random.normal((D,)).astype(mx.float32)
+    # Set K[target] explicitly via concat-replace (mx has no in-place).
+    K_arr = mx.concatenate([K[:target], dominant[None, :], K[target+1:]], axis=0)
+    V = mx.random.normal((B * H * T, D)).astype(mx.float32)
+    k_packed, k_norms = iso_compress(K_arr, bits, q_L, q_R, centroids)
+    v_packed, v_norms = iso_compress(V, bits, q_L, q_R, centroids)
+
+    # Query matches the dominant K direction.
+    q = dominant.reshape(B, H, 1, D)
+    scale = 1.0 / math.sqrt(D)
+
+    out = iso_fused_sparse_attend(
+        q, k_packed.reshape(B, H, T, -1), k_norms.reshape(B, H, T),
+        v_packed.reshape(B, H, T, -1), v_norms.reshape(B, H, T),
+        centroids, q_L, q_R, scale, D, bits, topk=1,
+    )
+    # Compare to V[target] decompressed (the one that should be selected).
+    V_dec = iso_decompress(v_packed, v_norms, D, bits, q_L, q_R, centroids)
+    expected = V_dec[target]
+    mx.eval(out, expected)
+    diff = mx.max(mx.abs(out.reshape(D) - expected)).item()
+    assert diff < 1e-2, (
+        f"topk=1 sparse should approx V[argmax score], diff={diff:.3e}"
+    )
+
+
+def test_iso_sparse_attend_fast_mode_runs():
+    """fast mode (q_R=None) goes through the has_qR=0 branch in both
+    kernels. Just verify it runs end-to-end without crashing or NaN."""
+    import math
+    from turboquant.mlx_fused_iso_attention import (
+        iso_compress, iso_fused_sparse_attend,
+        make_random_quaternions, _ISO_CODEBOOKS,
+    )
+    mx.random.seed(2)
+    B, H, D, T = 1, 1, 128, 128
+    bits = 3
+    q_L = make_random_quaternions(D // 4, seed=51)
+    centroids = _ISO_CODEBOOKS[bits]
+
+    K = mx.random.normal((B * H * T, D)).astype(mx.float32)
+    V = mx.random.normal((B * H * T, D)).astype(mx.float32)
+    k_packed, k_norms = iso_compress(K, bits, q_L, None, centroids)
+    v_packed, v_norms = iso_compress(V, bits, q_L, None, centroids)
+
+    q = mx.random.normal((B, H, 1, D)).astype(mx.float32)
+    scale = 1.0 / math.sqrt(D)
+    out = iso_fused_sparse_attend(
+        q,
+        k_packed.reshape(B, H, T, -1), k_norms.reshape(B, H, T),
+        v_packed.reshape(B, H, T, -1), v_norms.reshape(B, H, T),
+        centroids, q_L, None, scale, D, bits, topk=32,
+    )
+    mx.eval(out)
+    finite = mx.all(mx.isfinite(out)).item()
+    assert finite, "fast-mode sparse output has NaN/Inf"
+    assert out.shape == (B, H, 1, D)

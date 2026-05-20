@@ -910,6 +910,443 @@ def iso_flash_decode(
     return result.reshape(B, H, 1, dim)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Two-pass sparse attention (mirrors planar PR #8's phase1/phase2 design).
+#
+# At long context, dense flash decode dominated by V-decompression work for
+# tokens whose attention weight is ~0 after softmax. The two-pass split:
+#   phase1: score ALL tokens (cheap QK only) + emit per-tile top scores
+#   bridge: pick the topk-th highest score per head as a threshold
+#   phase2: do online-softmax + V-decompress + accumulate ONLY for tokens
+#           whose score >= threshold. Whole tiles with no survivors skip
+#           the V decompress entirely (huge win at sparse top-k).
+#
+# Approximation: phase1 thresholds by score (pre-softmax), so we keep the
+# top-k *attention logits*. This is the same approximation FlashAttention-Sparse
+# and PR #8 use; it's exact when top-k captures all non-negligible softmax mass.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+ISO_PHASE1_SCORE_KERNEL = """
+    // Phase 1: For each (tile, head), score every token in the tile (QK
+    // with iso decompress on K), write per-token score to all_scores, and
+    // track the top-4 scores in this tile for threshold derivation.
+    //
+    // grid:        (num_tiles * dim, n_bh, 1)
+    // threadgroup: (dim, 1, 1)
+
+    uint tile_idx = threadgroup_position_in_grid.x;
+    uint head_idx = threadgroup_position_in_grid.y;
+    uint elem = thread_position_in_threadgroup.x;
+    uint dim = dims[0];
+    uint seq_len = dims[1];
+    uint n_heads = dims[2];
+    uint bits = dims[3];
+    uint vals_per_word = dims[4];
+    uint packed_dim = dims[5];
+    uint tile_size = dims[6];
+    uint has_qR = dims[7];
+    uint bit_mask = (1u << bits) - 1u;
+
+    uint tile_start = tile_idx * tile_size;
+    uint tile_end = tile_start + tile_size;
+    if (tile_end > seq_len) tile_end = seq_len;
+
+    // Load Q once.
+    threadgroup float q_shared[1024];
+    q_shared[elem] = (float)query[head_idx * dim + elem];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float k_shared[1024];
+    threadgroup float dot_shared[1024];
+
+    // Top-4 in this tile (matches planar's top-4-per-tile budget).
+    threadgroup float tile_tops[4];
+    if (elem < 4) tile_tops[elem] = -1e30f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint seq_idx = tile_start; seq_idx < tile_end; seq_idx++) {
+        // ── Unpack K element + apply per-token norm ──────────────────────
+        uint word_idx = elem / vals_per_word;
+        uint pos_in_word = elem % vals_per_word;
+        uint k_word = k_packed[(head_idx * seq_len + seq_idx) * packed_dim + word_idx];
+        uint k_idx = (k_word >> (pos_in_word * bits)) & bit_mask;
+        float k_val = centroids[k_idx] * k_norms[head_idx * seq_len + seq_idx];
+
+        k_shared[elem] = k_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Inverse iso (quaternion sandwich) on K ───────────────────────
+        if (elem % 4 == 0) {
+            uint group_idx = elem / 4;
+            uint qbase = group_idx * 4;
+
+            float v0 = k_shared[elem];
+            float v1 = k_shared[elem + 1];
+            float v2 = k_shared[elem + 2];
+            float v3 = k_shared[elem + 3];
+
+            float qlw =  q_L[qbase + 0];
+            float qlx = -q_L[qbase + 1];
+            float qly = -q_L[qbase + 2];
+            float qlz = -q_L[qbase + 3];
+
+            float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
+            float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
+            float ty = qlw * v2 - qlx * v3 + qly * v0 + qlz * v1;
+            float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
+
+            if (has_qR == 1u) {
+                float qrw = q_R[qbase + 0];
+                float qrx = q_R[qbase + 1];
+                float qry = q_R[qbase + 2];
+                float qrz = q_R[qbase + 3];
+                k_shared[elem]     = tw * qrw - tx * qrx - ty * qry - tz * qrz;
+                k_shared[elem + 1] = tw * qrx + tx * qrw + ty * qrz - tz * qry;
+                k_shared[elem + 2] = tw * qry - tx * qrz + ty * qrw + tz * qrx;
+                k_shared[elem + 3] = tw * qrz + tx * qry - ty * qrx + tz * qrw;
+            } else {
+                k_shared[elem]     = tw;
+                k_shared[elem + 1] = tx;
+                k_shared[elem + 2] = ty;
+                k_shared[elem + 3] = tz;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── QK dot + tree reduce ────────────────────────────────────────
+        dot_shared[elem] = q_shared[elem] * k_shared[elem];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = dim / 2; stride > 0; stride >>= 1) {
+            if (elem < stride) dot_shared[elem] += dot_shared[elem + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (elem == 0) {
+            float score = dot_shared[0] * scale[0];
+            all_scores[head_idx * seq_len + seq_idx] = score;
+
+            // Insertion sort into top-4 (tile_tops kept descending).
+            if (score > tile_tops[3]) {
+                tile_tops[3] = score;
+                for (int i = 2; i >= 0; i--) {
+                    if (tile_tops[i+1] > tile_tops[i]) {
+                        float tmp = tile_tops[i];
+                        tile_tops[i] = tile_tops[i+1];
+                        tile_tops[i+1] = tmp;
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (elem < 4) {
+        uint base = (tile_idx * n_heads + head_idx) * 4;
+        tile_top_scores[base + elem] = tile_tops[elem];
+    }
+"""
+
+
+ISO_PHASE2_SPARSE_ATTEND_KERNEL = """
+    // Phase 2: For each (tile, head), read precomputed all_scores; for
+    // tokens with score >= threshold[head], do online softmax + V iso
+    // decompress + accumulate. Tiles whose every token is below threshold
+    // exit immediately (no V decompress, no barriers in the hot loop).
+    //
+    // Output is partial_o + tile_max + tile_sum_exp — same shape and
+    // semantics as ISO_FLASH_DECODE_KERNEL so the LSE merge in Python is
+    // unchanged.
+
+    uint tile_idx = threadgroup_position_in_grid.x;
+    uint head_idx = threadgroup_position_in_grid.y;
+    uint elem = thread_position_in_threadgroup.x;
+    uint dim = dims[0];
+    uint seq_len = dims[1];
+    uint n_heads = dims[2];
+    uint bits = dims[3];
+    uint vals_per_word = dims[4];
+    uint packed_dim = dims[5];
+    uint tile_size = dims[6];
+    uint has_qR = dims[7];
+    uint bit_mask = (1u << bits) - 1u;
+
+    uint tile_start = tile_idx * tile_size;
+    uint tile_end = tile_start + tile_size;
+    if (tile_end > seq_len) tile_end = seq_len;
+
+    float threshold_val = threshold[head_idx];
+
+    // ── Tile-level early exit: skip entire tile if no survivors ──────
+    threadgroup bool tile_has_survivors[1];
+    if (elem == 0) {
+        tile_has_survivors[0] = false;
+        for (uint i = tile_start; i < tile_end; i++) {
+            if (all_scores[head_idx * seq_len + i] >= threshold_val) {
+                tile_has_survivors[0] = true;
+                break;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (!tile_has_survivors[0]) {
+        uint out_base = (tile_idx * n_heads + head_idx) * dim;
+        partial_o[out_base + elem] = 0.0f;
+        if (elem == 0) {
+            uint meta = tile_idx * n_heads + head_idx;
+            tile_max[meta] = -1e30f;
+            tile_sum_exp[meta] = 0.0f;
+        }
+        return;
+    }
+
+    // Online softmax state.
+    threadgroup float s_max[1];
+    threadgroup float s_sum[1];
+    threadgroup float s_corr[1];
+    threadgroup float s_expsc[1];
+    if (elem == 0) {
+        s_max[0] = -1e30f;
+        s_sum[0] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float v_shared[1024];
+    float acc_v = 0.0f;
+
+    for (uint seq_idx = tile_start; seq_idx < tile_end; seq_idx++) {
+        float score = all_scores[head_idx * seq_len + seq_idx];
+        if (score < threshold_val) continue;
+
+        // Online softmax update.
+        if (elem == 0) {
+            float old_max = s_max[0];
+            float new_max = (score > old_max) ? score : old_max;
+            float corr = exp(old_max - new_max);
+            float es = exp(score - new_max);
+            s_max[0] = new_max;
+            s_sum[0] = s_sum[0] * corr + es;
+            s_corr[0] = corr;
+            s_expsc[0] = es;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float corr = s_corr[0];
+        float es = s_expsc[0];
+        acc_v = acc_v * corr;
+
+        // ── Unpack V element + apply norm ────────────────────────────────
+        uint word_idx = elem / vals_per_word;
+        uint pos_in_word = elem % vals_per_word;
+        uint v_word = v_packed[(head_idx * seq_len + seq_idx) * packed_dim + word_idx];
+        uint v_idx = (v_word >> (pos_in_word * bits)) & bit_mask;
+        float v_val = centroids[v_idx] * v_norms[head_idx * seq_len + seq_idx];
+
+        v_shared[elem] = v_val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ── Inverse iso on V ────────────────────────────────────────────
+        if (elem % 4 == 0) {
+            uint group_idx = elem / 4;
+            uint qbase = group_idx * 4;
+
+            float v0 = v_shared[elem];
+            float v1 = v_shared[elem + 1];
+            float v2 = v_shared[elem + 2];
+            float v3 = v_shared[elem + 3];
+
+            float qlw =  q_L[qbase + 0];
+            float qlx = -q_L[qbase + 1];
+            float qly = -q_L[qbase + 2];
+            float qlz = -q_L[qbase + 3];
+
+            float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
+            float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
+            float ty = qlw * v2 - qlx * v3 + qly * v0 + qlz * v1;
+            float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
+
+            if (has_qR == 1u) {
+                float qrw = q_R[qbase + 0];
+                float qrx = q_R[qbase + 1];
+                float qry = q_R[qbase + 2];
+                float qrz = q_R[qbase + 3];
+                v_shared[elem]     = tw * qrw - tx * qrx - ty * qry - tz * qrz;
+                v_shared[elem + 1] = tw * qrx + tx * qrw + ty * qrz - tz * qry;
+                v_shared[elem + 2] = tw * qry - tx * qrz + ty * qrw + tz * qrx;
+                v_shared[elem + 3] = tw * qrz + tx * qry - ty * qrx + tz * qrw;
+            } else {
+                v_shared[elem]     = tw;
+                v_shared[elem + 1] = tx;
+                v_shared[elem + 2] = ty;
+                v_shared[elem + 3] = tz;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        acc_v += es * v_shared[elem];
+    }
+
+    uint out_base = (tile_idx * n_heads + head_idx) * dim;
+    partial_o[out_base + elem] = acc_v;
+
+    if (elem == 0) {
+        uint meta = tile_idx * n_heads + head_idx;
+        tile_max[meta] = s_max[0];
+        tile_sum_exp[meta] = s_sum[0];
+    }
+"""
+
+
+_iso_phase1_kernel = None
+_iso_phase2_sparse_kernel = None
+
+
+def iso_fused_sparse_attend(
+    query: mx.array,
+    k_packed: mx.array,
+    k_norms: mx.array,
+    v_packed: mx.array,
+    v_norms: mx.array,
+    centroids: mx.array,
+    q_L: mx.array,
+    q_R: Optional[mx.array],
+    scale: float,
+    dim: int,
+    bits: int,
+    topk: int = 1024,
+) -> mx.array:
+    """Two-pass sparse attention over iso-quantized K, V.
+
+    Mirrors `fused_sparse_attend` from the planar module: phase1 scores all
+    tokens with QK + iso decompress on K, the bridge picks a per-head
+    threshold equal to the topk-th highest score, phase2 does online
+    softmax + V iso decompress + accumulate only for tokens at or above
+    the threshold. Output shape and LSE merge match `iso_flash_decode`,
+    so the two are drop-in interchangeable at the call site.
+
+    When `topk >= seq_len`, the threshold ends up at the minimum score
+    so phase2 visits every token and the result is numerically identical
+    to `iso_flash_decode` (modulo a difference in the score-write order
+    inside fp32 — usually < 1e-4).
+
+    Args:
+        query, k_packed, k_norms, v_packed, v_norms, centroids, q_L, q_R,
+        scale, dim, bits: same as `iso_flash_decode`.
+        topk: keep only the top-k highest-scoring tokens per head.
+
+    Returns: (B, H, 1, dim).
+    """
+    global _iso_phase1_kernel, _iso_phase2_sparse_kernel
+    if _iso_phase1_kernel is None:
+        _iso_phase1_kernel = mx.fast.metal_kernel(
+            name="iso_phase1_score",
+            input_names=["query", "k_packed", "k_norms", "centroids",
+                         "q_L", "q_R", "scale", "dims"],
+            output_names=["all_scores", "tile_top_scores"],
+            source=ISO_PHASE1_SCORE_KERNEL,
+        )
+    if _iso_phase2_sparse_kernel is None:
+        _iso_phase2_sparse_kernel = mx.fast.metal_kernel(
+            name="iso_phase2_sparse_attend",
+            input_names=["all_scores", "v_packed", "v_norms", "centroids",
+                         "q_L", "q_R", "threshold", "dims"],
+            output_names=["partial_o", "tile_max", "tile_sum_exp"],
+            source=ISO_PHASE2_SPARSE_ATTEND_KERNEL,
+        )
+
+    B = query.shape[0]
+    H = query.shape[1]
+    seq_len = k_norms.shape[2]
+    p_dim = k_packed.shape[-1]
+    vpw = _VALS_PER_WORD[bits]
+    num_tiles = (seq_len + ISO_TILE_SIZE - 1) // ISO_TILE_SIZE
+    n_bh = B * H
+    top_per_tile = 4
+    assert dim % 4 == 0 and dim <= 1024
+    assert q_L.shape[0] * 4 == dim
+
+    has_qR = 1 if q_R is not None else 0
+    q_R_flat = (q_R if q_R is not None else mx.zeros_like(q_L)).astype(mx.float32).reshape(-1)
+    q_L_flat = q_L.astype(mx.float32).reshape(-1)
+
+    scale_arr = mx.array([scale], dtype=mx.float32)
+    dims_arr = mx.array(
+        [dim, seq_len, n_bh, bits, vpw, p_dim, ISO_TILE_SIZE, has_qR],
+        dtype=mx.uint32,
+    )
+
+    # ── Phase 1: score all tokens, collect per-tile top-4 ────────────────
+    phase1_out = _iso_phase1_kernel(
+        inputs=[
+            query.astype(mx.float32).reshape(n_bh * dim),
+            k_packed.astype(mx.uint32).reshape(n_bh * seq_len * p_dim),
+            k_norms.astype(mx.float32).reshape(n_bh * seq_len),
+            centroids, q_L_flat, q_R_flat, scale_arr, dims_arr,
+        ],
+        template=[("T", mx.float32)],
+        grid=(num_tiles * dim, n_bh, 1),
+        threadgroup=(dim, 1, 1),
+        output_shapes=[(n_bh * seq_len,),
+                       (num_tiles * n_bh * top_per_tile,)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+
+    all_scores = phase1_out[0]
+    tile_tops = phase1_out[1].reshape(num_tiles, n_bh, top_per_tile)
+
+    # ── Bridge: per-head threshold = topk-th highest score ───────────────
+    # tile_tops carries the top-4 from each tile. Per head we have
+    # num_tiles * 4 candidates; the topk-th highest among those is the
+    # threshold. When topk >= seq_len we must keep every token — but
+    # min(all_tops) is *not* "keep everything" (it only thresholds out
+    # below-top-4-per-tile tokens), so set threshold to -inf instead.
+    all_tops = tile_tops.reshape(-1, n_bh).transpose()  # (n_bh, num_tiles*4)
+    n_candidates = all_tops.shape[1]
+    if topk >= seq_len:
+        threshold = mx.full((n_bh,), -1e30, dtype=mx.float32)
+    elif topk < n_candidates:
+        topk_vals = mx.topk(all_tops, k=topk, axis=-1)
+        threshold = mx.min(topk_vals, axis=-1)
+    else:
+        # topk between n_candidates and seq_len: not enough tile-top
+        # candidates to derive an exact threshold; min(all_tops) is the
+        # best conservative estimate (may keep a few more than topk).
+        threshold = mx.min(all_tops, axis=-1)
+    mx.eval(threshold)  # tiny array — flush before phase2 dispatch
+
+    # ── Phase 2: sparse V decompress + online softmax ────────────────────
+    phase2_out = _iso_phase2_sparse_kernel(
+        inputs=[
+            all_scores,
+            v_packed.astype(mx.uint32).reshape(n_bh * seq_len * p_dim),
+            v_norms.astype(mx.float32).reshape(n_bh * seq_len),
+            centroids, q_L_flat, q_R_flat, threshold, dims_arr,
+        ],
+        template=[("T", mx.float32)],
+        grid=(num_tiles * dim, n_bh, 1),
+        threadgroup=(dim, 1, 1),
+        output_shapes=[(num_tiles * n_bh * dim,),
+                       (num_tiles * n_bh,),
+                       (num_tiles * n_bh,)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+
+    partial_o = phase2_out[0].reshape(num_tiles, n_bh, dim)
+    t_max = phase2_out[1].reshape(num_tiles, n_bh, 1)
+    t_sum_exp = phase2_out[2].reshape(num_tiles, n_bh, 1)
+
+    # LSE merge — identical to iso_flash_decode.
+    global_max = mx.max(t_max, axis=0, keepdims=True)
+    corrections = mx.exp(t_max - global_max)
+    numerator = mx.sum(partial_o * corrections, axis=0)
+    denominator = mx.sum(t_sum_exp * corrections, axis=0)
+    result = numerator / (denominator + 1e-8)
+
+    return result.reshape(B, H, 1, dim)
+
+
 def iso_unrotate_metal(x: mx.array, q_L: mx.array, q_R: Optional[mx.array] = None) -> mx.array:
     """Metal-fused inverse IsoQuant rotation. Equivalent to `iso_unrotate` but
     runs a single Metal threadgroup per row.
