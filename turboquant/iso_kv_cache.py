@@ -21,12 +21,32 @@ from typing import Optional, Tuple
 import mlx.core as mx
 
 from .mlx_fused_iso_attention import (
+    _DEFAULT_D,
     _ISO_CODEBOOKS,
     compute_codebooks,
     iso_compress,
     iso_decompress,
     iso_flash_decode,
 )
+
+
+# Cache codebooks by (head_dim, bits) so each constructor call is O(1) after
+# the first. Lloyd-Max via scipy.integrate.quad is ~5-30s per (d, bits) combo
+# and rebuilding it on every IsoKVCache instance was a hidden perf cliff.
+_CODEBOOK_CACHE: dict[tuple[int, int], mx.array] = {}
+
+
+def _get_codebook(head_dim: int, bits: int) -> mx.array:
+    key = (head_dim, bits)
+    cached = _CODEBOOK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if head_dim == _DEFAULT_D and bits in _ISO_CODEBOOKS:
+        cb = _ISO_CODEBOOKS[bits]
+    else:
+        cb = compute_codebooks(head_dim, bits_list=(bits,))[bits]
+    _CODEBOOK_CACHE[key] = cb
+    return cb
 
 
 class IsoKVCache:
@@ -67,12 +87,14 @@ class IsoKVCache:
         assert q_L.shape[0] * 4 == head_dim, (
             f"q_L groups {q_L.shape[0]} × 4 ≠ head_dim {head_dim}"
         )
+        # `head_dim in _ISO_CODEBOOKS` was always False before (the dict is
+        # keyed by bits) — falling through to compute_codebooks on every call.
+        # Now goes via the (head_dim, bits) cache so repeated construction
+        # (e.g., one cache per layer) is free.
         if centroids is not None:
             self.centroids = centroids
-        elif head_dim in _ISO_CODEBOOKS:
-            self.centroids = _ISO_CODEBOOKS[bits]
         else:
-            self.centroids = compute_codebooks(head_dim, bits_list=(bits,))[bits]
+            self.centroids = _get_codebook(head_dim, bits)
 
         # Per-(layer, head, token) packed storage. Built lazily on first update.
         # Shapes after first update: k_packed (B, H, T, packed_dim) uint32
