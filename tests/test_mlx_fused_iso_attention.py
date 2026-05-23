@@ -527,6 +527,63 @@ def test_iso_compress_metal_matches_pure(mode, bits):
         )
 
 
+@pytest.mark.parametrize("mode", ["full", "fast"])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+def test_iso_decompress_metal_matches_pure(mode, bits):
+    """The Metal-fused iso_decompress must round-trip with iso_compress_metal
+    and give the same reconstructed vector as the pure-MLX decompress path
+    on identical inputs."""
+    from turboquant.mlx_fused_iso_attention import (
+        iso_compress_metal, iso_decompress_metal, iso_unrotate, _unpack,
+        make_random_quaternions, compute_codebooks,
+    )
+    mx.random.seed(0)
+    D = 128
+    n_groups = D // 4
+    q_L = make_random_quaternions(n_groups, seed=21)
+    q_R = make_random_quaternions(n_groups, seed=22) if mode == "full" else None
+    centroids = compute_codebooks(D, bits_list=(bits,))[bits]
+    x = mx.random.normal((16, D)).astype(mx.float32)
+
+    packed, norms = iso_compress_metal(x, bits, q_L, q_R, centroids)
+
+    # Pure-MLX reference decompress (inline so we don't accidentally
+    # fast-path back through Metal).
+    indices = _unpack(packed, bits, D).astype(mx.int32)
+    values = centroids[indices]
+    rotated_full = values * norms[..., None]
+    out_ref = iso_unrotate(rotated_full, q_L, q_R).astype(mx.float32)
+
+    out_metal = iso_decompress_metal(packed, norms, D, bits, q_L, q_R, centroids)
+    mx.eval(out_ref, out_metal)
+    diff = mx.max(mx.abs(out_ref - out_metal)).item()
+    assert diff < 1e-4, (
+        f"decompress metal vs pure: max diff {diff:.3e} (bits={bits}, mode={mode})"
+    )
+
+
+def test_iso_decompress_metal_dtype_passthrough():
+    """The fused decompress should write its output in the requested dtype
+    (bf16 is the production case for SDPA), not silently upcast to fp32."""
+    from turboquant.mlx_fused_iso_attention import (
+        iso_compress_metal, iso_decompress_metal, make_random_quaternions,
+        compute_codebooks,
+    )
+    mx.random.seed(0)
+    D = 128
+    n_groups = D // 4
+    q_L = make_random_quaternions(n_groups, seed=31)
+    q_R = make_random_quaternions(n_groups, seed=32)
+    centroids = compute_codebooks(D, bits_list=(3,))[3]
+    x = mx.random.normal((8, D)).astype(mx.float32)
+    packed, norms = iso_compress_metal(x, 3, q_L, q_R, centroids)
+    for dtype in (mx.bfloat16, mx.float16, mx.float32):
+        out = iso_decompress_metal(packed, norms, D, 3, q_L, q_R, centroids, dtype=dtype)
+        assert out.dtype == dtype, (
+            f"requested dtype={dtype}, got {out.dtype}"
+        )
+
+
 def test_iso_compress_metal_per_head_routes_correctly():
     """When given 3D q_L (H, n_groups, 4) and input shaped (B*T, H, D),
     the fused kernel must apply the per-head rotor at each row. Verify by

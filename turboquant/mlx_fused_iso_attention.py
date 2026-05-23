@@ -302,6 +302,14 @@ def iso_decompress(
     if centroids is None:
         centroids = _get_default_codebook(bits)
 
+    # Metal fast-path mirrors iso_compress: same shape constraints, same
+    # per-head indexing convention. Replaces ~10 dispatched ops with one
+    # kernel writing directly into `dtype`.
+    if dim <= 1024 and (dim & (dim - 1)) == 0 and bits in _VALS_PER_WORD:
+        return iso_decompress_metal(
+            packed, norms, dim, bits, q_L, q_R, centroids, dtype=dtype,
+        )
+
     indices = _unpack(packed, bits, dim).astype(mx.int32)
     values = centroids[indices]  # (..., dim) — in rotated unit space
 
@@ -1722,3 +1730,159 @@ def iso_compress_metal(
     packed = outputs[0].reshape(*original_shape[:-1], packed_dim)
     norms = outputs[1].reshape(*original_shape[:-1])
     return packed, norms
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fused iso_decompress kernel — symmetric to iso_compress. Replaces ~10
+# dispatched MLX ops (unpack, gather, scale, two quat_mul, astype) with one
+# Metal threadgroup per row. Profile attributed ~92% of iso step time to
+# decompress, so this is the biggest remaining lever.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+ISO_DECOMPRESS_KERNEL = """
+    // One threadgroup per row, `dim` threads per threadgroup. Does:
+    //   unpack-bits -> centroid lookup -> scale by per-row norm ->
+    //   inverse iso rotate -> write output.
+    //
+    // Per-head rotors via (n_heads_real, rows_per_head); same convention
+    // as ISO_INVERSE_ROTATE_KERNEL.
+
+    uint row = threadgroup_position_in_grid.x;
+    uint elem = thread_position_in_threadgroup.x;
+    uint d = dims[0];
+    uint bits = dims[1];
+    uint vals_per_word = dims[2];
+    uint packed_dim = dims[3];
+    uint has_qR = dims[4];
+    uint n_heads_real = dims[5];
+    uint rows_per_head = dims[6];
+    uint bit_mask = (1u << bits) - 1u;
+
+    uint head_in_layer = (n_heads_real <= 1u) ? 0u
+                        : ((row / rows_per_head) % n_heads_real);
+
+    // ── Unpack this thread's element + centroid lookup + scale ──────────
+    uint word_idx = elem / vals_per_word;
+    uint pos_in_word = elem % vals_per_word;
+    uint word = packed[row * packed_dim + word_idx];
+    uint idx = (word >> (pos_in_word * bits)) & bit_mask;
+    float val = centroids[idx] * norms[row];
+
+    // ── Stage in shared so 4-block peers can read ───────────────────────
+    threadgroup float v_shared[1024];
+    v_shared[elem] = val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Inverse iso rotation per 4-block: conj(q_L) * v * q_R ──────────
+    if (elem % 4 == 0) {
+        uint group_idx = elem / 4;
+        uint qbase = head_in_layer * d + group_idx * 4;
+
+        float v0 = v_shared[elem];
+        float v1 = v_shared[elem + 1];
+        float v2 = v_shared[elem + 2];
+        float v3 = v_shared[elem + 3];
+
+        // conj(q_L) negates xyz, keeps w
+        float qlw =  q_L[qbase + 0];
+        float qlx = -q_L[qbase + 1];
+        float qly = -q_L[qbase + 2];
+        float qlz = -q_L[qbase + 3];
+
+        float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
+        float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
+        float ty = qlw * v2 - qlx * v3 + qly * v0 + qlz * v1;
+        float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
+
+        if (has_qR == 1u) {
+            float qrw = q_R[qbase + 0];
+            float qrx = q_R[qbase + 1];
+            float qry = q_R[qbase + 2];
+            float qrz = q_R[qbase + 3];
+            v_shared[elem]     = tw * qrw - tx * qrx - ty * qry - tz * qrz;
+            v_shared[elem + 1] = tw * qrx + tx * qrw + ty * qrz - tz * qry;
+            v_shared[elem + 2] = tw * qry - tx * qrz + ty * qrw + tz * qrx;
+            v_shared[elem + 3] = tw * qrz + tx * qry - ty * qrx + tz * qrw;
+        } else {
+            v_shared[elem]     = tw;
+            v_shared[elem + 1] = tx;
+            v_shared[elem + 2] = ty;
+            v_shared[elem + 3] = tz;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write in target dtype T (set via template at kernel construction).
+    out[row * d + elem] = (T)v_shared[elem];
+"""
+
+
+_iso_decompress_kernel = None
+
+
+def iso_decompress_metal(
+    packed: mx.array,
+    norms: mx.array,
+    dim: int,
+    bits: int,
+    q_L: mx.array,
+    q_R: Optional[mx.array] = None,
+    centroids: Optional[mx.array] = None,
+    dtype=mx.float32,
+    rows_per_head: int = 1,
+) -> mx.array:
+    """Single-dispatch Metal version of iso_decompress.
+
+    Replaces the pure-MLX op chain (unpack -> centroids[idx] -> *norms ->
+    iso_unrotate -> astype) with one Metal kernel per row. Output is
+    written directly in `dtype` so callers (e.g. IsoKVCache decoding to
+    bf16 for downstream SDPA) save the explicit cast.
+
+    Constraints:
+      - dim ≤ 1024
+      - dim must be a power of 2
+      - bits in {1..6}
+    """
+    if centroids is None:
+        centroids = _get_default_codebook(bits)
+
+    global _iso_decompress_kernel
+    if _iso_decompress_kernel is None:
+        _iso_decompress_kernel = mx.fast.metal_kernel(
+            name="iso_decompress",
+            input_names=["packed", "norms", "centroids", "q_L", "q_R", "dims"],
+            output_names=["out"],
+            source=ISO_DECOMPRESS_KERNEL,
+        )
+
+    vpw = _VALS_PER_WORD[bits]
+    packed_dim = (dim + vpw - 1) // vpw
+    assert dim <= 1024, f"iso_decompress_metal: dim {dim} > 1024 shared budget"
+    assert (dim & (dim - 1)) == 0, f"iso_decompress_metal: dim {dim} must be a power of 2"
+
+    original_shape = packed.shape[:-1] + (dim,)
+    n_rows = 1
+    for s in packed.shape[:-1]:
+        n_rows *= s
+
+    has_qR = 1 if q_R is not None else 0
+    q_L_flat, q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, dim)
+    dims_arr = mx.array(
+        [dim, bits, vpw, packed_dim, has_qR, n_heads_real, rows_per_head],
+        dtype=mx.uint32,
+    )
+
+    outputs = _iso_decompress_kernel(
+        inputs=[
+            packed.astype(mx.uint32).reshape(n_rows * packed_dim),
+            norms.astype(mx.float32).reshape(n_rows),
+            centroids, q_L_flat, q_R_flat, dims_arr,
+        ],
+        template=[("T", dtype)],
+        grid=(n_rows * dim, 1, 1),
+        threadgroup=(dim, 1, 1),
+        output_shapes=[(n_rows * dim,)],
+        output_dtypes=[dtype],
+    )
+    return outputs[0].reshape(original_shape)
