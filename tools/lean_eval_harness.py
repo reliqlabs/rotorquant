@@ -31,6 +31,7 @@ import mlx.core as mx
 
 
 PROMPTS = [
+    # ── Nat / arithmetic (basics) ─────────────────────────────────────
     {
         "name": "add_zero",
         "user": "Write a Lean 4 theorem proving n + 0 = n for natural numbers, using only `rfl` if possible. Output only the Lean 4 code.",
@@ -47,10 +48,52 @@ PROMPTS = [
         "expects": {"theorem": True, "tactic": "induction"},
     },
     {
-        "name": "list_length",
-        "user": "Define a Lean 4 function `length : List α → Nat` that returns the length of a list. Output only the Lean 4 code.",
-        "expects": {"theorem": False, "function": True},
+        "name": "add_assoc",
+        "user": "Prove associativity of natural number addition in Lean 4: for all a b c, (a + b) + c = a + (b + c). Use induction. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "induction"},
     },
+    {
+        "name": "mul_one",
+        "user": "Write a Lean 4 theorem stating n * 1 = n for natural numbers. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "one_mul",
+        "user": "Prove in Lean 4 that 1 * n = n for natural numbers. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "simp"},
+    },
+    {
+        "name": "mul_zero",
+        "user": "Write a Lean 4 theorem proving n * 0 = 0 for natural numbers, with the shortest possible proof. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "rfl"},
+    },
+    {
+        "name": "mul_comm",
+        "user": "Prove commutativity of multiplication on Nat in Lean 4: a * b = b * a. Use Mathlib if needed. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    # ── Nat ordering / inequalities ────────────────────────────────────
+    {
+        "name": "le_refl",
+        "user": "Prove reflexivity of ≤ on natural numbers in Lean 4: for all n, n ≤ n. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "le_trans",
+        "user": "Prove transitivity of ≤ on Nat in Lean 4: a ≤ b and b ≤ c implies a ≤ c. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "zero_le",
+        "user": "Prove in Lean 4 that 0 ≤ n for any natural number n. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "lt_succ_self",
+        "user": "Prove in Lean 4 that n < n + 1 for any Nat. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    # ── Nat parity / evenness ──────────────────────────────────────────
     {
         "name": "even_double",
         "user": "Prove in Lean 4 that 2 * n is always even, where Even is defined as ∃ k, n = 2 * k. Output only the Lean 4 code.",
@@ -61,15 +104,126 @@ PROMPTS = [
         "user": "State and prove in Lean 4 that the successor function on Nat is injective. Output only the Lean 4 code.",
         "expects": {"theorem": True},
     },
+    # ── Lists ──────────────────────────────────────────────────────────
     {
-        "name": "le_refl",
-        "user": "Prove reflexivity of ≤ on natural numbers in Lean 4: for all n, n ≤ n. Output only the Lean 4 code.",
-        "expects": {"theorem": True},
+        "name": "list_length",
+        "user": "Define a Lean 4 function `length : List α → Nat` that returns the length of a list. Output only the Lean 4 code.",
+        "expects": {"theorem": False, "function": True},
     },
+    {
+        "name": "list_append_length",
+        "user": "Prove in Lean 4 that (xs ++ ys).length = xs.length + ys.length for any two lists. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "induction"},
+    },
+    {
+        "name": "list_reverse_reverse",
+        "user": "Prove in Lean 4 that reversing a list twice gives the original list: xs.reverse.reverse = xs. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "induction"},
+    },
+    {
+        "name": "list_map_append",
+        "user": "Prove in Lean 4 that mapping a function over an appended list distributes: (xs ++ ys).map f = xs.map f ++ ys.map f. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "induction"},
+    },
+    {
+        "name": "list_filter_def",
+        "user": "Define a Lean 4 function `filter (p : α → Bool) (xs : List α) : List α` that keeps only the elements satisfying p. Output only the Lean 4 code.",
+        "expects": {"theorem": False, "function": True},
+    },
+    # ── Propositional logic ────────────────────────────────────────────
     {
         "name": "and_comm",
         "user": "Prove in Lean 4 that propositional conjunction is commutative: P ∧ Q ↔ Q ∧ P. Output only the Lean 4 code.",
         "expects": {"theorem": True, "tactic": "constructor"},
+    },
+    {
+        "name": "or_comm",
+        "user": "Prove in Lean 4 that propositional disjunction is commutative: P ∨ Q ↔ Q ∨ P. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "double_negation",
+        "user": "Prove in Lean 4 that ¬¬P ↔ P for any decidable proposition P. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "demorgan_or",
+        "user": "Prove De Morgan's law in Lean 4: ¬(P ∨ Q) ↔ ¬P ∧ ¬Q. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "constructor"},
+    },
+    {
+        "name": "implication_chain",
+        "user": "Prove in Lean 4: if P → Q and Q → R then P → R. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "intro"},
+    },
+    # ── Functions / injectivity ────────────────────────────────────────
+    {
+        "name": "id_injective",
+        "user": "Prove in Lean 4 that the identity function on any type is injective. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "comp_injective",
+        "user": "Prove in Lean 4 that the composition of two injective functions is injective. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    # ── Algebra (Group / Ring / Field) ─────────────────────────────────
+    {
+        "name": "group_mul_inv",
+        "user": "Prove in Lean 4 (using Mathlib) that in a group, a * a⁻¹ = 1. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "group_inv_inv",
+        "user": "Prove in Lean 4 (using Mathlib) that in a group, (a⁻¹)⁻¹ = a. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "ring_mul_zero",
+        "user": "Prove in Lean 4 (using Mathlib) that in any ring, a * 0 = 0. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "ring_distrib",
+        "user": "Prove in Lean 4 (using Mathlib) the left distributive law: a * (b + c) = a * b + a * c in any ring. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "binomial_sq",
+        "user": "Prove in Lean 4 (using Mathlib's `ring` tactic) that (a + b)^2 = a^2 + 2*a*b + b^2 over the reals. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "ring"},
+    },
+    {
+        "name": "diff_of_squares",
+        "user": "Prove in Lean 4 (using Mathlib's `ring` tactic) that (x - y) * (x + y) = x^2 - y^2 over the reals. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "ring"},
+    },
+    # ── Combinatorics / Number theory ──────────────────────────────────
+    {
+        "name": "choose_zero",
+        "user": "Prove in Lean 4 (using Mathlib) that Nat.choose n 0 = 1 for any n. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "gcd_comm",
+        "user": "Prove in Lean 4 (using Mathlib) that Nat.gcd is commutative: gcd a b = gcd b a. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "gcd_self",
+        "user": "Prove in Lean 4 (using Mathlib) that Nat.gcd n n = n. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    # ── Calculus / Analysis ────────────────────────────────────────────
+    {
+        "name": "deriv_x_squared",
+        "user": "In Lean 4 with Mathlib, show that the derivative of fun x => x^2 is fun x => 2*x. Output only the Lean 4 code.",
+        "expects": {"theorem": True},
+    },
+    {
+        "name": "linarith_simple",
+        "user": "Prove in Lean 4 (using Mathlib's linarith tactic) that if a < b for real numbers, then a + 1 < b + 1. Output only the Lean 4 code.",
+        "expects": {"theorem": True, "tactic": "linarith"},
     },
 ]
 

@@ -102,11 +102,17 @@ def main() -> int:
     ap.add_argument("--n-prompts", type=int, default=len(PROMPTS))
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--print-first", action="store_true")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="seed for mx.random (controls sampler RNG + iso-random "
+                         "fallback rotors). Default: None = unseeded.")
     args = ap.parse_args()
 
     if args.mode == "iso-calibrated" and not args.rotors:
         ap.error("--rotors is required when --mode=iso-calibrated")
 
+    if args.seed is not None:
+        mx.random.seed(args.seed)
+        print(f"[iso-eval] mx.random.seed({args.seed})", flush=True)
     print(f"[iso-eval] loading {args.model} (mode={args.mode})", flush=True)
     from mlx_lm import generate
     from mlx_lm.sample_utils import make_sampler
