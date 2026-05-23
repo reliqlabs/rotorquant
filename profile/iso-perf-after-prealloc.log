@@ -1,0 +1,51 @@
+[load] loading /Users/mvid/Development/reliq/models/leanstral-2603-mlx-4bit
+[probe] head_dim=128 n_layers=36
+[prompt] prefill_tokens=5
+
+=== HEADLINE: per-cache decode timing ===
+[head]              cache: prefill ...    | decode p10/median/mean   | tok/sec
+[head]           baseline: prefill  267.4ms | decode p10 13.21ms median 13.69ms mean 13.58ms | tok/sec   73.0
+[head]        iso6-random: prefill   78.1ms | decode p10 15.38ms median 15.70ms mean 15.71ms | tok/sec   63.7
+[head]        iso5-random: prefill   32.8ms | decode p10 15.25ms median 15.75ms mean 15.73ms | tok/sec   63.5
+[head]        iso4-random: prefill   33.3ms | decode p10 15.37ms median 15.72ms mean 15.72ms | tok/sec   63.6
+
+=== DRILL 1: update_and_fetch vs rest of model forward ===
+[uf]   iso5: step median  48.33ms | uf total median  43.66ms (90.4%) | compress median  26.33ms | decompress median  13.70ms
+[uf]   iso5: per-layer update_and_fetch ~ 1.213ms × 36 layers (note: timer overhead inflates due to eval+sync per call)
+[uf]   iso4: step median  47.73ms | uf total median  43.18ms (90.5%) | compress median  26.22ms | decompress median  13.62ms
+[uf]   iso4: per-layer update_and_fetch ~ 1.200ms × 36 layers (note: timer overhead inflates due to eval+sync per call)
+
+=== DRILL 2: micro-bench iso_compress vs iso_decompress on a single layer ===
+[micro] head_dim=128 n_kv_heads=32 bits=5 T_cache=8
+[micro] iso5: single-layer compress(1 new tok) ≈   172.8µs | decompress(9 cached toks) ≈   163.2µs | per step est. = 36 × (c + d) ≈ 12.10ms
+[micro] head_dim=128 n_kv_heads=32 bits=5 T_cache=32
+[micro] iso5: single-layer compress(1 new tok) ≈   173.2µs | decompress(33 cached toks) ≈   166.6µs | per step est. = 36 × (c + d) ≈ 12.23ms
+[micro] head_dim=128 n_kv_heads=32 bits=5 T_cache=128
+[micro] iso5: single-layer compress(1 new tok) ≈   166.1µs | decompress(129 cached toks) ≈   169.7µs | per step est. = 36 × (c + d) ≈ 12.09ms
+[micro] head_dim=128 n_kv_heads=32 bits=4 T_cache=32
+[micro] iso4: single-layer compress(1 new tok) ≈   159.8µs | decompress(33 cached toks) ≈   158.5µs | per step est. = 36 × (c + d) ≈ 11.46ms
+
+=== DRILL 4: attend() / iso_flash_decode microbench (skip model) ===
+[atn]  iso5 T=  32: decompress+SDPA =   195.3µs | fused attend() =   228.2µs | ratio = 0.86x
+[atn]  iso5 T= 128: decompress+SDPA =   202.3µs | fused attend() =   363.4µs | ratio = 0.56x
+[atn]  iso4 T=  32: decompress+SDPA =   179.5µs | fused attend() =   228.8µs | ratio = 0.78x
+[atn]  iso4 T= 128: decompress+SDPA =   205.6µs | fused attend() =   362.0µs | ratio = 0.57x
+
+=== DRILL 5: how does decompress scale with T_cache? ===
+[micro] head_dim=128 n_kv_heads=32 bits=5 T_cache=8
+[micro] iso5: single-layer compress(1 new tok) ≈   164.0µs | decompress(9 cached toks) ≈   157.9µs | per step est. = 36 × (c + d) ≈ 11.59ms
+[micro] head_dim=128 n_kv_heads=32 bits=5 T_cache=16
+[micro] iso5: single-layer compress(1 new tok) ≈   162.9µs | decompress(17 cached toks) ≈   153.3µs | per step est. = 36 × (c + d) ≈ 11.38ms
+[micro] head_dim=128 n_kv_heads=32 bits=5 T_cache=32
+[micro] iso5: single-layer compress(1 new tok) ≈   169.3µs | decompress(33 cached toks) ≈   168.8µs | per step est. = 36 × (c + d) ≈ 12.17ms
+[micro] head_dim=128 n_kv_heads=32 bits=5 T_cache=64
+[micro] iso5: single-layer compress(1 new tok) ≈   173.0µs | decompress(65 cached toks) ≈   167.7µs | per step est. = 36 × (c + d) ≈ 12.27ms
+[micro] head_dim=128 n_kv_heads=32 bits=5 T_cache=128
+[micro] iso5: single-layer compress(1 new tok) ≈   169.1µs | decompress(129 cached toks) ≈   197.2µs | per step est. = 36 × (c + d) ≈ 13.19ms
+[micro] head_dim=128 n_kv_heads=32 bits=5 T_cache=256
+[micro] iso5: single-layer compress(1 new tok) ≈   173.3µs | decompress(257 cached toks) ≈   173.8µs | per step est. = 36 × (c + d) ≈ 12.50ms
+
+=== DRILL 3: metal capture (if available) ===
+[metal] capture failed: RuntimeError: [metal::start_capture] Failed to start: Capture layer is not inserted.
+
+[done]
