@@ -1,19 +1,26 @@
-## KV cache compression with IsoQuant (optional)
+## KV cache compression with IsoQuant (experimental)
 
-This MLX quant works with [IsoQuant](https://github.com/reliqlabs/rotorquant) for a
-**~3.2× smaller KV cache** at decode time with no measurable quality cost. Useful
-when you're running long context on a memory-constrained Apple Silicon machine.
+This MLX quant is compatible with [IsoQuant](https://github.com/reliqlabs/rotorquant)
+for a smaller KV cache at decode time. In our limited tests on Leanstral-2603-MLX-4bit
+the 5-bit iso cache used about 3× less memory than fp16 KV while producing similar
+output on a small Lean-generation benchmark. Decode was roughly 1.2× slower than the
+default cache after Metal kernel fusion.
 
-**TL;DR numbers** (Leanstral 4-bit, M5, 37 Lean-generation prompts × 3 seeds):
+**Test setup**: 37 Lean-prompt eval × 3 random seeds on an M5, max_tokens=256,
+temperature=1.0. Scoring uses regex heuristics for the presence of theorem syntax,
+named tactics, etc. — not Lean type-checking. This is a thin signal on a narrow
+domain; broader benchmarks may show different tradeoffs.
 
-| | Strict | Soft | Decode | Cache memory |
+| | strict (mean ± stdev) | soft (mean ± stdev) | decode | cache memory |
 |---|---|---|---|---|
 | Default fp16 KV cache | 61.6% ± 7.1% | 85.0% ± 3.2% | 1.00× | 1.00× |
-| **iso5 random KV cache** | **59.7% ± 5.8%** | 82.9% ± 2.7% | **1.15-1.22×** slower | **3.2× smaller** |
+| iso, 5 bits, random rotors | 59.7% ± 5.8% | 82.9% ± 2.7% | ~1.15-1.22× slower | ~3.2× smaller |
+| iso, 4 bits, random rotors | 54.7% ± 6.5% | 82.9% ± 2.4% | ~1.2× slower | ~4× smaller |
+| iso, 6 bits, random rotors | 65.4% ± 4.3% | 85.0% ± 2.6% | ~1.2× slower | ~2.7× smaller |
 
-iso5 is within baseline's own seed-to-seed jitter on strict score. No calibration
-pipeline needed — random rotors at 5 bits suffice for this architecture (Leanstral
-uses MLA, which limits the headroom that per-rotor calibration can buy).
+iso-5 sits within baseline's seed-to-seed variance on this benchmark — that's the
+basis for considering it a near-no-cost option, but the sample is small (37 prompts,
+one domain) and we make no broader quality claims.
 
 ### Usage
 
@@ -24,14 +31,12 @@ cd rotorquant && pip install -e .
 ```
 
 ```python
-import mlx.core as mx
 from mlx_vlm import load, generate
 from turboquant.iso_kv_cache import IsoKVCache
 from turboquant.mlx_fused_iso_attention import make_random_quaternions
 
 model, processor = load("mvid/Leanstral-2603-MLX-4bit")
-lm = model.language_model           # iso cache attaches to the LM, not the wrapper
-head_dim = 128                      # Leanstral KV head_dim
+head_dim = 128         # Leanstral KV head_dim
 n_layers = 36
 n_groups = head_dim // 4
 
@@ -45,23 +50,24 @@ caches = [
     for i in range(n_layers)
 ]
 
-# mlx-vlm passes `cache` straight through to the LM forward.
 out = generate(model, processor, prompt="...", prompt_cache=caches, max_tokens=256)
 ```
 
-### Bit-width tradeoffs
+### Notes and caveats
 
-| bits | Cache memory | Strict score | Notes |
-|---|---|---|---|
-| 4 | 4× smaller | 54.7% ± 6.5% | ~7 pp below baseline; only choose if memory is tight |
-| **5** | **3.2× smaller** | **59.7% ± 5.8%** | **Recommended.** Baseline parity within noise |
-| 6 | 2.7× smaller | 65.4% ± 4.3% | Lowest seed variance; matches or beats baseline |
-
-### Implementation notes
-
-- The cache uses fused Metal kernels for compress and decompress; decode is ~1.2× slower than the default cache (down from ~6.5× before kernel fusion).
-- Random rotors are used here for simplicity; calibrated rotors (per the original RotorQuant paper) are also supported via `load_rotors_into_cache_factory(...)`, but for MLA models they don't measurably beat random.
-- Quality numbers above are on a small Lean-generation prompt set; for other domains, run your own eval before adopting.
+- We also experimented with calibrated rotors (per the RotorQuant paper). On this
+  model (Leanstral uses MLA — multi-head latent attention — where K is expanded
+  from a low-rank latent) they did not measurably outperform random rotors on our
+  benchmark. Calibration may still pay off on architectures with more per-head
+  variance; we have not tested those.
+- Per-head rotors (one per KV head per layer) were tested and did not help on this
+  model for the same MLA-related reason.
+- Decode speed numbers are after fused compress/decompress Metal kernels and a
+  bf16 dtype-return fix. Pre-fusion the slowdown was closer to 6× — verify on
+  your own hardware.
+- Quality scoring uses output-text regex heuristics, not Lean type-checking. A
+  more rigorous eval (e.g., Lean compiler verification) might show different
+  results.
 
 See [the rotorquant fork](https://github.com/reliqlabs/rotorquant) for sweep CSVs,
 profile logs, and the full eval harness.
