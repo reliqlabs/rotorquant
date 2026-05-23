@@ -108,10 +108,41 @@ def main() -> int:
         ap.error("--rotors is required when --mode=iso-calibrated")
 
     print(f"[iso-eval] loading {args.model} (mode={args.mode})", flush=True)
-    from mlx_lm import load, generate
+    from mlx_lm import generate
     from mlx_lm.sample_utils import make_sampler
 
-    model, tokenizer = load(args.model)
+    # The Leanstral MLX quants are wrapped as Mistral3 (vision + LM). mlx_lm.load
+    # rejects the language_model.* weights as "not in model"; we have to go via
+    # mlx_vlm.load and pull out the inner LM. Detect from config and route.
+    model_type = None
+    try:
+        import json
+        from pathlib import Path as _P
+        cfg_path = _P(args.model) / "config.json"
+        if cfg_path.exists():
+            with open(cfg_path) as f:
+                model_type = json.load(f).get("model_type")
+    except Exception:
+        pass
+    is_multimodal = model_type == "mistral3"
+
+    if is_multimodal:
+        from mlx_vlm import load as vlm_load
+        wrapper, processor = vlm_load(args.model)
+        # The Mistral3 wrapper exposes the LM at `.language_model`. Some
+        # mlx_vlm versions wrap it once more under `.model.language_model`.
+        if hasattr(wrapper, "language_model"):
+            model = wrapper.language_model
+        elif hasattr(wrapper, "model") and hasattr(wrapper.model, "language_model"):
+            model = wrapper.model.language_model
+        else:
+            raise RuntimeError("Could not locate language_model on mlx_vlm wrapper")
+        tokenizer = getattr(processor, "tokenizer", processor)
+        print(f"[iso-eval] mistral3 wrapper -> using .language_model "
+              f"({type(model).__name__})", flush=True)
+    else:
+        from mlx_lm import load
+        model, tokenizer = load(args.model)
 
     # Probe head_dim + n_layers by running a 1-token forward with the
     # default cache — robust across mlx-lm model classes that don't
