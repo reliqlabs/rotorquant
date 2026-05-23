@@ -1,26 +1,26 @@
-## KV cache compression with IsoQuant (experimental)
+## KV cache compression with IsoQuant (prototype)
 
 This MLX quant is compatible with [IsoQuant](https://github.com/reliqlabs/rotorquant)
-for a smaller KV cache at decode time. In our limited tests on Leanstral-2603-MLX-4bit
-the 5-bit iso cache used about 3× less memory than fp16 KV while producing similar
-output on a small Lean-generation benchmark. Decode was roughly 1.2× slower than the
-default cache after Metal kernel fusion.
+for a smaller KV cache at decode time. This section reports preliminary results from
+a working prototype — not a production recommendation. If you want a smaller KV
+cache and are comfortable evaluating quality on your own workload, the snippet
+below shows how to plug it in.
 
-**Test setup**: 37 Lean-prompt eval × 3 random seeds on an M5, max_tokens=256,
-temperature=1.0. Scoring uses regex heuristics for the presence of theorem syntax,
-named tactics, etc. — not Lean type-checking. This is a thin signal on a narrow
-domain; broader benchmarks may show different tradeoffs.
+### What we observed
+
+On Leanstral-2603-MLX-4bit, with a 5-bit iso cache and random rotors, on a small
+Lean-generation benchmark (37 prompts × 3 random seeds, M5, max_tokens=256,
+temperature=1.0, scoring via regex heuristics — not Lean type-checking):
 
 | | strict (mean ± stdev) | soft (mean ± stdev) | decode | cache memory |
 |---|---|---|---|---|
 | Default fp16 KV cache | 61.6% ± 7.1% | 85.0% ± 3.2% | 1.00× | 1.00× |
 | iso, 5 bits, random rotors | 59.7% ± 5.8% | 82.9% ± 2.7% | ~1.15-1.22× slower | ~3.2× smaller |
-| iso, 4 bits, random rotors | 54.7% ± 6.5% | 82.9% ± 2.4% | ~1.2× slower | ~4× smaller |
-| iso, 6 bits, random rotors | 65.4% ± 4.3% | 85.0% ± 2.6% | ~1.2× slower | ~2.7× smaller |
 
-iso-5 sits within baseline's seed-to-seed variance on this benchmark — that's the
-basis for considering it a near-no-cost option, but the sample is small (37 prompts,
-one domain) and we make no broader quality claims.
+iso-5 sat within baseline's seed-to-seed variance on this benchmark. The sample is
+small (37 prompts, one narrow domain) and the scoring is text-pattern matching
+rather than the Lean toolchain, so don't read too much into the headline numbers.
+Re-run against your own workload before adopting.
 
 ### Usage
 
@@ -55,19 +55,16 @@ out = generate(model, processor, prompt="...", prompt_cache=caches, max_tokens=2
 
 ### Notes and caveats
 
-- We also experimented with calibrated rotors (per the RotorQuant paper). On this
-  model (Leanstral uses MLA — multi-head latent attention — where K is expanded
-  from a low-rank latent) they did not measurably outperform random rotors on our
-  benchmark. Calibration may still pay off on architectures with more per-head
-  variance; we have not tested those.
-- Per-head rotors (one per KV head per layer) were tested and did not help on this
-  model for the same MLA-related reason.
-- Decode speed numbers are after fused compress/decompress Metal kernels and a
-  bf16 dtype-return fix. Pre-fusion the slowdown was closer to 6× — verify on
-  your own hardware.
-- Quality scoring uses output-text regex heuristics, not Lean type-checking. A
-  more rigorous eval (e.g., Lean compiler verification) might show different
-  results.
+- We also tested 4-bit and 6-bit iso caches and calibrated (rather than random)
+  rotors. On this model the 4-bit configuration scored noticeably below baseline
+  on our benchmark, and calibrated rotors did not measurably outperform random.
+  Leanstral uses MLA (multi-head latent attention), where K is expanded from a
+  low-rank latent — calibration may pay off more on architectures with more
+  per-head variance; we have not tested those.
+- Speed numbers are after fused compress/decompress Metal kernels and a bf16
+  dtype-return fix. Pre-fusion the slowdown was closer to 6×.
+- Quality scoring uses output-text regex heuristics. Lean type-checking might
+  give a materially different picture.
 
 See [the rotorquant fork](https://github.com/reliqlabs/rotorquant) for sweep CSVs,
 profile logs, and the full eval harness.
