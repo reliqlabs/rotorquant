@@ -137,6 +137,10 @@ class IsoKVCache:
         self.k_norms: Optional[mx.array] = None
         self.v_packed: Optional[mx.array] = None
         self.v_norms: Optional[mx.array] = None
+        # Native dtype the caller hands us K/V in. We return decompressed
+        # tensors in this dtype so downstream SDPA stays in its fast bf16/
+        # fp16 path instead of being forced into fp32. Set on first update.
+        self.output_dtype: Optional[mx.Dtype] = None
         self.offset = 0  # number of tokens cached so far
 
     @property
@@ -189,21 +193,28 @@ class IsoKVCache:
         self, packed: mx.array, norms: mx.array,
         q_L: mx.array, q_R: Optional[mx.array],
     ) -> mx.array:
-        """(B, H, T, packed_dim) + (B, H, T) -> (B, H, T, head_dim)."""
+        """(B, H, T, packed_dim) + (B, H, T) -> (B, H, T, head_dim).
+
+        Returns in self.output_dtype so downstream SDPA stays in the model's
+        native (bf16/fp16) fast path instead of being upcast to fp32. The
+        math inside iso_decompress still runs at fp32; only the final cast
+        differs.
+        """
+        out_dtype = self.output_dtype or mx.float32
         B, H, T, _ = packed.shape
         if self.per_head_rotors:
             packed_perm = packed.transpose(0, 2, 1, 3).reshape(B * T, H, packed.shape[-1])
             norms_perm = norms.transpose(0, 2, 1).reshape(B * T, H)
             out = iso_decompress(
                 packed_perm, norms_perm, self.head_dim, self.iso_bits,
-                q_L, q_R, self.centroids,
+                q_L, q_R, self.centroids, dtype=out_dtype,
             )
             return out.reshape(B, T, H, self.head_dim).transpose(0, 2, 1, 3)
         flat_packed = packed.reshape(-1, packed.shape[-1])
         flat_norms = norms.reshape(-1)
         flat_out = iso_decompress(
             flat_packed, flat_norms, self.head_dim, self.iso_bits,
-            q_L, q_R, self.centroids,
+            q_L, q_R, self.centroids, dtype=out_dtype,
         )
         return flat_out.reshape(B, H, T, self.head_dim)
 
@@ -213,6 +224,10 @@ class IsoKVCache:
         K, V shape: (B, n_kv_heads, T_new, head_dim).
         Returns the same shape but with T = total tokens cached.
         """
+        # Latch input dtype on first call so decompress can return in
+        # the model's native dtype (bf16/fp16) rather than upcasting to fp32.
+        if self.output_dtype is None:
+            self.output_dtype = K.dtype
         new_k_packed, new_k_norms = self._compress_block(K, self.q_L, self.q_R)
         new_v_packed, new_v_norms = self._compress_block(V, self.v_q_L, self.v_q_R)
 
