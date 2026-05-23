@@ -140,6 +140,18 @@ def main() -> int:
         tokenizer = getattr(processor, "tokenizer", processor)
         print(f"[iso-eval] mistral3 wrapper -> using .language_model "
               f"({type(model).__name__})", flush=True)
+        # mlx_vlm Mistral3 LM returns LanguageModelOutput(logits=...). mlx_lm
+        # generate_step does logits[:, -1, :] on the model() result, so we
+        # patch __call__ to unwrap and return raw logits.
+        _LMCls = type(model)
+        if not getattr(_LMCls, "_iso_unwrapped", False):
+            _orig_call = _LMCls.__call__
+            def _unwrapped_call(self, *args, **kwargs):
+                out = _orig_call(self, *args, **kwargs)
+                return getattr(out, "logits", out)
+            _LMCls.__call__ = _unwrapped_call
+            _LMCls._iso_unwrapped = True
+            print("[iso-eval] patched LanguageModel.__call__ to return raw logits", flush=True)
     else:
         from mlx_lm import load
         model, tokenizer = load(args.model)
