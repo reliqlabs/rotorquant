@@ -147,13 +147,29 @@ def compute_codebooks(d: int, bits_list=(2, 3, 4)) -> dict:
     return out
 
 
-# Precomputed at import for the Leanstral head_dim.
+# Precomputed at import for the Leanstral head_dim. Default `bits_list=(2,3,4)`
+# is small enough to keep import fast. Higher bit-widths fall through to
+# `_get_default_codebook` on first use and are memoized into this dict.
 _ISO_CODEBOOKS = compute_codebooks(_DEFAULT_D)
+
+
+def _get_default_codebook(bits: int) -> mx.array:
+    """Return the default-head_dim codebook for `bits`. Lazily computes and
+    memoizes for bit widths not in the precomputed `_ISO_CODEBOOKS` dict."""
+    if bits in _ISO_CODEBOOKS:
+        return _ISO_CODEBOOKS[bits]
+    cb = compute_codebooks(_DEFAULT_D, bits_list=(bits,))[bits]
+    _ISO_CODEBOOKS[bits] = cb
+    return cb
 
 
 # ── Packing helpers (shared with PlanarQuant) ────────────────────────────────
 
-_VALS_PER_WORD = {1: 32, 2: 16, 3: 10, 4: 8}
+# Maps bits → vals-packed-per-uint32. Higher bits leave some padding (e.g.
+# 6-bit = 5 vals × 6 bits = 30 used, 2 padded), same pattern as 3-bit
+# (10 × 3 = 30). The Metal kernels do `word >> (pos * bits) & bit_mask`
+# so any (bits, vpw) where bits * vpw ≤ 32 works.
+_VALS_PER_WORD = {1: 32, 2: 16, 3: 10, 4: 8, 5: 6, 6: 5}
 
 
 def _prepare_rotors_for_kernel(
@@ -249,7 +265,7 @@ def iso_compress(
         norms:  (...,) float32 — original ||x|| (kernel multiplies centroid by this)
     """
     if centroids is None:
-        centroids = _ISO_CODEBOOKS[bits]
+        centroids = _get_default_codebook(bits)
 
     x_f = x.astype(mx.float32)
     norms = mx.linalg.norm(x_f, axis=-1, keepdims=True)
@@ -275,7 +291,7 @@ def iso_decompress(
 ) -> mx.array:
     """Reverse of `iso_compress`. Returns (..., dim) reconstructed in original space."""
     if centroids is None:
-        centroids = _ISO_CODEBOOKS[bits]
+        centroids = _get_default_codebook(bits)
 
     indices = _unpack(packed, bits, dim).astype(mx.int32)
     values = centroids[indices]  # (..., dim) — in rotated unit space
