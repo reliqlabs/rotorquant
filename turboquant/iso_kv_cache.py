@@ -130,9 +130,14 @@ class IsoKVCache:
         else:
             self.centroids = _get_codebook(head_dim, bits)
 
-        # Per-(layer, head, token) packed storage. Built lazily on first update.
-        # Shapes after first update: k_packed (B, H, T, packed_dim) uint32
-        #                           k_norms  (B, H, T)              float32
+        # Per-(layer, head, token) packed storage. The buffer is pre-allocated
+        # in `step`-token chunks (mirrors mlx-lm's KVCache strategy) so the
+        # per-step update is a slot-write rather than a concat-and-copy. At
+        # T=4096 the concat was O(T) per step; with this it's O(step) only
+        # when the buffer needs to grow.
+        #   k_packed: (B, H, buffer_T, packed_dim) uint32
+        #   k_norms:  (B, H, buffer_T)             float32
+        # `offset` is the actually-occupied length; the buffer may be larger.
         self.k_packed: Optional[mx.array] = None
         self.k_norms: Optional[mx.array] = None
         self.v_packed: Optional[mx.array] = None
@@ -142,6 +147,7 @@ class IsoKVCache:
         # fp16 path instead of being forced into fp32. Set on first update.
         self.output_dtype: Optional[mx.Dtype] = None
         self.offset = 0  # number of tokens cached so far
+        self.step = 256  # growth granularity — matches mlx-lm KVCache default
 
     @property
     def state(self) -> Tuple[Optional[mx.array], Optional[mx.array]]:
@@ -198,9 +204,13 @@ class IsoKVCache:
         Returns in self.output_dtype so downstream SDPA stays in the model's
         native (bf16/fp16) fast path instead of being upcast to fp32. The
         math inside iso_decompress still runs at fp32; only the final cast
-        differs.
+        differs. Slices the underlying buffer to `self.offset` so we never
+        decompress trailing unused capacity.
         """
         out_dtype = self.output_dtype or mx.float32
+        # Slice off any unused buffer tail before decompressing.
+        packed = packed[:, :, :self.offset, :]
+        norms = norms[:, :, :self.offset]
         B, H, T, _ = packed.shape
         if self.per_head_rotors:
             packed_perm = packed.transpose(0, 2, 1, 3).reshape(B * T, H, packed.shape[-1])
@@ -218,11 +228,46 @@ class IsoKVCache:
         )
         return flat_out.reshape(B, H, T, self.head_dim)
 
+    def _ensure_capacity(self, B: int, H: int, t_new: int, packed_dim: int) -> None:
+        """Grow the storage buffer if appending t_new tokens would overflow.
+        Allocates in `self.step`-token chunks and merges via a single concat
+        (called O(T/step) times per generation instead of every step).
+        """
+        needed = self.offset + t_new
+        cur = 0 if self.k_packed is None else self.k_packed.shape[2]
+        if needed <= cur:
+            return
+        # Round the new capacity up to the next step boundary.
+        n_steps = (needed - cur + self.step - 1) // self.step
+        grow = n_steps * self.step
+        shape_p = (B, H, grow, packed_dim)
+        shape_n = (B, H, grow)
+        if self.k_packed is None:
+            # Distinct allocations — sharing the same buffer between K and V
+            # would let the V slot-write clobber K below.
+            self.k_packed = mx.zeros(shape_p, dtype=mx.uint32)
+            self.k_norms = mx.zeros(shape_n, dtype=mx.float32)
+            self.v_packed = mx.zeros(shape_p, dtype=mx.uint32)
+            self.v_norms = mx.zeros(shape_n, dtype=mx.float32)
+        else:
+            self.k_packed = mx.concatenate(
+                [self.k_packed, mx.zeros(shape_p, dtype=mx.uint32)], axis=2)
+            self.k_norms = mx.concatenate(
+                [self.k_norms, mx.zeros(shape_n, dtype=mx.float32)], axis=2)
+            self.v_packed = mx.concatenate(
+                [self.v_packed, mx.zeros(shape_p, dtype=mx.uint32)], axis=2)
+            self.v_norms = mx.concatenate(
+                [self.v_norms, mx.zeros(shape_n, dtype=mx.float32)], axis=2)
+
     def update_and_fetch(self, K: mx.array, V: mx.array) -> Tuple[mx.array, mx.array]:
         """Append new K, V tokens; return the full decompressed (K, V) so far.
 
         K, V shape: (B, n_kv_heads, T_new, head_dim).
         Returns the same shape but with T = total tokens cached.
+
+        Pre-allocated buffer pattern: writes to a slot at [..., offset:offset+T,
+        :] rather than concatenating; grows the buffer only when needed
+        (every `step` tokens by default).
         """
         # Latch input dtype on first call so decompress can return in
         # the model's native dtype (bf16/fp16) rather than upcasting to fp32.
@@ -230,19 +275,19 @@ class IsoKVCache:
             self.output_dtype = K.dtype
         new_k_packed, new_k_norms = self._compress_block(K, self.q_L, self.q_R)
         new_v_packed, new_v_norms = self._compress_block(V, self.v_q_L, self.v_q_R)
+        B, H, T_new, _ = new_k_packed.shape
+        packed_dim = new_k_packed.shape[-1]
 
-        if self.k_packed is None:
-            self.k_packed = new_k_packed
-            self.k_norms = new_k_norms
-            self.v_packed = new_v_packed
-            self.v_norms = new_v_norms
-        else:
-            self.k_packed = mx.concatenate([self.k_packed, new_k_packed], axis=2)
-            self.k_norms = mx.concatenate([self.k_norms, new_k_norms], axis=2)
-            self.v_packed = mx.concatenate([self.v_packed, new_v_packed], axis=2)
-            self.v_norms = mx.concatenate([self.v_norms, new_v_norms], axis=2)
+        self._ensure_capacity(B, H, T_new, packed_dim)
 
-        self.offset += K.shape[2]
+        prev, new_off = self.offset, self.offset + T_new
+        # mlx-style slot write: returns a new array but the compiler can
+        # treat this as in-place when the LHS array has refcount 1.
+        self.k_packed[:, :, prev:new_off, :] = new_k_packed
+        self.k_norms[:, :, prev:new_off] = new_k_norms
+        self.v_packed[:, :, prev:new_off, :] = new_v_packed
+        self.v_norms[:, :, prev:new_off] = new_v_norms
+        self.offset = new_off
         return self._decompress_k(), self._decompress_v()
 
     def memory_bytes(self) -> int:
@@ -285,13 +330,19 @@ class IsoKVCache:
         """
         if self.k_packed is None:
             raise RuntimeError("IsoKVCache.attend called before update_and_fetch")
+        # Slice to actual occupied length — the pre-allocated buffer may have
+        # trailing zero capacity that the Metal kernels would otherwise iterate.
+        kp = self.k_packed[:, :, :self.offset, :]
+        kn = self.k_norms[:, :, :self.offset]
+        vp = self.v_packed[:, :, :self.offset, :]
+        vn = self.v_norms[:, :, :self.offset]
         if topk is not None:
             return iso_fused_sparse_attend(
                 query=query,
-                k_packed=self.k_packed,
-                k_norms=self.k_norms,
-                v_packed=self.v_packed,
-                v_norms=self.v_norms,
+                k_packed=kp,
+                k_norms=kn,
+                v_packed=vp,
+                v_norms=vn,
                 centroids=self.centroids,
                 q_L=self.q_L,
                 q_R=self.q_R,
@@ -304,10 +355,10 @@ class IsoKVCache:
             )
         return iso_flash_decode(
             query=query,
-            k_packed=self.k_packed,
-            k_norms=self.k_norms,
-            v_packed=self.v_packed,
-            v_norms=self.v_norms,
+            k_packed=kp,
+            k_norms=kn,
+            v_packed=vp,
+            v_norms=vn,
             centroids=self.centroids,
             v_q_L=self.v_q_L,
             v_q_R=self.v_q_R,

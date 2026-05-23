@@ -112,6 +112,60 @@ def test_attend_raises_before_update():
         cache.attend(q, 1.0)
 
 
+def test_prealloc_buffer_grows_across_step_boundary():
+    """The pre-allocated buffer pattern must survive crossing the step
+    boundary (default 256 tokens). Decoded output after growth should match
+    a fresh cache that was given everything in one shot."""
+    cache = _make_cache(head_dim=128, bits=3)
+    cache.step = 32  # tighter step → exercises multiple grow events fast
+
+    mx.random.seed(13)
+    chunks = []
+    for n in (5, 10, 20, 50, 80):  # crosses step=32 multiple times
+        K = mx.random.normal((1, 2, n, 128))
+        V = mx.random.normal((1, 2, n, 128))
+        chunks.append((K, V))
+        cache.update_and_fetch(K, V)
+    assert cache.offset == sum(c[0].shape[2] for c in chunks)
+
+    # Reference: feed it all in one shot to a fresh cache.
+    ref = _make_cache(head_dim=128, bits=3)
+    all_K = mx.concatenate([c[0] for c in chunks], axis=2)
+    all_V = mx.concatenate([c[1] for c in chunks], axis=2)
+    ref.update_and_fetch(all_K, all_V)
+
+    # state should match — bit-stable since both went through the same
+    # compress path on identical K, V.
+    k1, v1 = cache.state
+    k2, v2 = ref.state
+    mx.eval(k1, k2, v1, v2)
+    assert k1.shape == k2.shape
+    assert mx.max(mx.abs(k1.astype(mx.float32) - k2.astype(mx.float32))).item() < 1e-5
+    assert mx.max(mx.abs(v1.astype(mx.float32) - v2.astype(mx.float32))).item() < 1e-5
+
+
+def test_prealloc_buffer_capacity_grows_in_step_multiples():
+    """Buffer .shape[2] should grow in `step` increments, not match offset
+    exactly — that's the whole point of the pre-allocation."""
+    cache = _make_cache(head_dim=128, bits=3)
+    cache.step = 64
+    K = mx.random.normal((1, 2, 10, 128))
+    V = mx.random.normal((1, 2, 10, 128))
+    cache.update_and_fetch(K, V)
+    assert cache.offset == 10
+    # Buffer rounded up to step boundary (64), not exactly 10.
+    assert cache.k_packed.shape[2] == 64, (
+        f"buffer should be 64 tokens, got {cache.k_packed.shape[2]}"
+    )
+    # Adding 100 more crosses one step boundary — capacity should grow once.
+    K2 = mx.random.normal((1, 2, 100, 128))
+    V2 = mx.random.normal((1, 2, 100, 128))
+    cache.update_and_fetch(K2, V2)
+    assert cache.offset == 110
+    # Needed 110, allocated next multiple of 64 >= 110 → 128 total.
+    assert cache.k_packed.shape[2] == 128
+
+
 def test_attend_topk_keep_all_matches_dense():
     """`attend(topk=T)` should route to sparse but with threshold=-inf, so
     output matches the dense flash-decode path within fp32 rounding."""
@@ -155,11 +209,9 @@ def test_attend_topk_one_picks_top_token():
     scale = 1.0 / math.sqrt(128)
     out = cache.attend(q, scale, topk=1)
 
-    V_dec = iso_decompress(
-        cache.v_packed.reshape(-1, cache.v_packed.shape[-1]),
-        cache.v_norms.reshape(-1),
-        128, 3, cache.q_L, cache.q_R, cache.centroids,
-    ).reshape(1, 1, T, 128)
+    # Use the public accessor — directly reading cache.v_packed would pick
+    # up the pre-allocated buffer tail and miss the offset slice.
+    V_dec = cache.values
     expected = V_dec[0, 0, target]
     mx.eval(out, expected)
     diff = mx.max(mx.abs(out.reshape(128) - expected)).item()
