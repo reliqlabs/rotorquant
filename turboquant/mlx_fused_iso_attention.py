@@ -267,6 +267,15 @@ def iso_compress(
     if centroids is None:
         centroids = _get_default_codebook(bits)
 
+    # Metal fast-path: one threadgroup per row replaces ~25 MLX op dispatches.
+    # Only applies when shape constraints hold AND q_L is the per-layer or
+    # per-head shape supported by the kernel (the kernel handles both via
+    # n_heads_real / rows_per_head). Pure-MLX fallback covers oddly-shaped
+    # inputs (non-power-of-2 dim, dim > 1024, etc.).
+    d = x.shape[-1]
+    if d <= 1024 and (d & (d - 1)) == 0 and bits in _VALS_PER_WORD:
+        return iso_compress_metal(x, bits, q_L, q_R, centroids)
+
     x_f = x.astype(mx.float32)
     norms = mx.linalg.norm(x_f, axis=-1, keepdims=True)
     x_unit = x_f / mx.maximum(norms, 1e-8)
@@ -1508,3 +1517,208 @@ def iso_unrotate_metal(
         output_dtypes=[mx.float32],
     )
     return outputs[0].reshape(original_shape).astype(x.dtype)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fused iso_compress kernel — replaces ~25 dispatched MLX ops with one Metal
+# threadgroup per row. Profile on Leanstral 4-bit showed the un-fused path
+# was responsible for ~12 ms / decode step (72 K+V calls × ~15 ops each).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+ISO_COMPRESS_KERNEL = """
+    // One threadgroup per input row, `dim` threads per threadgroup.
+    // Performs: norm -> normalize -> forward iso rotate -> nearest centroid
+    // index -> bit-pack into uint32 words. All in shared memory; no
+    // intermediate global writes.
+
+    uint row = threadgroup_position_in_grid.x;
+    uint elem = thread_position_in_threadgroup.x;
+    uint dim = dims[0];
+    uint bits = dims[1];
+    uint vals_per_word = dims[2];
+    uint packed_dim = dims[3];
+    uint has_qR = dims[4];
+    uint n_heads_real = dims[5];
+    uint rows_per_head = dims[6];
+    uint n_centroids = (1u << bits);
+
+    uint head_in_layer = (n_heads_real <= 1u) ? 0u
+                        : ((row / rows_per_head) % n_heads_real);
+
+    // Stage input row into shared memory.
+    threadgroup float v_shared[1024];
+    v_shared[elem] = (float)x[row * dim + elem];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute squared L2 norm via tree reduction.
+    threadgroup float sq_shared[1024];
+    sq_shared[elem] = v_shared[elem] * v_shared[elem];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = dim / 2; stride > 0; stride >>= 1) {
+        if (elem < stride) sq_shared[elem] += sq_shared[elem + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Thread 0 finalizes norm, broadcasts via singleton.
+    threadgroup float norm_shared[1];
+    if (elem == 0) {
+        float s = sq_shared[0];
+        norm_shared[0] = sqrt(max(s, 1e-16f));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float norm = norm_shared[0];
+
+    // Normalize in-place into v_shared.
+    v_shared[elem] = v_shared[elem] / norm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Forward iso rotation: q_L * v * conj(q_R) per 4-block.
+    if (elem % 4 == 0) {
+        uint group_idx = elem / 4;
+        uint qbase = head_in_layer * dim + group_idx * 4;
+
+        float v0 = v_shared[elem];
+        float v1 = v_shared[elem + 1];
+        float v2 = v_shared[elem + 2];
+        float v3 = v_shared[elem + 3];
+
+        // tmp = q_L * v  (Hamilton product, full q_L)
+        float qlw = q_L[qbase + 0];
+        float qlx = q_L[qbase + 1];
+        float qly = q_L[qbase + 2];
+        float qlz = q_L[qbase + 3];
+
+        float tw = qlw * v0 - qlx * v1 - qly * v2 - qlz * v3;
+        float tx = qlw * v1 + qlx * v0 + qly * v3 - qlz * v2;
+        float ty = qlw * v2 - qlx * v3 + qly * v0 + qlz * v1;
+        float tz = qlw * v3 + qlx * v2 - qly * v1 + qlz * v0;
+
+        if (has_qR == 1u) {
+            // out = tmp * conj(q_R) — conj negates xyz, keeps w.
+            float qrw =  q_R[qbase + 0];
+            float qrx = -q_R[qbase + 1];
+            float qry = -q_R[qbase + 2];
+            float qrz = -q_R[qbase + 3];
+            v_shared[elem]     = tw * qrw - tx * qrx - ty * qry - tz * qrz;
+            v_shared[elem + 1] = tw * qrx + tx * qrw + ty * qrz - tz * qry;
+            v_shared[elem + 2] = tw * qry - tx * qrz + ty * qrw + tz * qrx;
+            v_shared[elem + 3] = tw * qrz + tx * qry - ty * qrx + tz * qrw;
+        } else {
+            v_shared[elem]     = tw;
+            v_shared[elem + 1] = tx;
+            v_shared[elem + 2] = ty;
+            v_shared[elem + 3] = tz;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Quantize: each thread finds the nearest centroid for its element.
+    float my_val = v_shared[elem];
+    float best_diff = 1e30f;
+    uint best_idx = 0u;
+    for (uint i = 0; i < n_centroids; i++) {
+        float d = my_val - centroids[i];
+        if (d < 0.0f) d = -d;
+        if (d < best_diff) {
+            best_diff = d;
+            best_idx = i;
+        }
+    }
+
+    // Stage indices for packing.
+    threadgroup uint idx_shared[1024];
+    idx_shared[elem] = best_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Pack: thread at the start of each word collects its `vals_per_word`
+    // peers and OR-shifts them into a single uint32. Threads past
+    // `packed_dim * vals_per_word` (rare; only when dim isn't a clean
+    // multiple) write zero-padded slots.
+    if ((elem % vals_per_word) == 0) {
+        uint word_idx = elem / vals_per_word;
+        if (word_idx < packed_dim) {
+            uint word = 0u;
+            for (uint i = 0; i < vals_per_word; i++) {
+                if (elem + i < dim) {
+                    word |= (idx_shared[elem + i] << (i * bits));
+                }
+            }
+            packed[row * packed_dim + word_idx] = word;
+        }
+    }
+
+    // Thread 0 writes the per-row norm.
+    if (elem == 0) {
+        norms[row] = norm;
+    }
+"""
+
+
+_iso_compress_kernel = None
+
+
+def iso_compress_metal(
+    x: mx.array,
+    bits: int,
+    q_L: mx.array,
+    q_R: Optional[mx.array] = None,
+    centroids: Optional[mx.array] = None,
+    rows_per_head: int = 1,
+) -> Tuple[mx.array, mx.array]:
+    """Single-dispatch Metal version of iso_compress.
+
+    Same semantics as the pure-MLX `iso_compress` but fuses normalize,
+    rotate, quantize, and pack into one threadgroup per row. Replaces ~25
+    MLX op dispatches with one, which on Leanstral's decode path (36
+    layers × K+V = 72 calls per step) was costing ~12 ms / step.
+
+    Constraints:
+      - dim ≤ 1024 (shared memory layout fixed at 1024 floats).
+      - dim must be a power of 2 for the tree-reduce on the norm.
+      - bits in {1, 2, 3, 4, 5, 6}.
+    """
+    if centroids is None:
+        centroids = _get_default_codebook(bits)
+
+    global _iso_compress_kernel
+    if _iso_compress_kernel is None:
+        _iso_compress_kernel = mx.fast.metal_kernel(
+            name="iso_compress",
+            input_names=["x", "q_L", "q_R", "centroids", "dims"],
+            output_names=["packed", "norms"],
+            source=ISO_COMPRESS_KERNEL,
+        )
+
+    d = x.shape[-1]
+    vpw = _VALS_PER_WORD[bits]
+    packed_dim = (d + vpw - 1) // vpw
+    assert d <= 1024, f"iso_compress_metal: dim {d} > 1024 shared budget"
+    assert (d & (d - 1)) == 0, f"iso_compress_metal: dim {d} must be a power of 2"
+
+    original_shape = x.shape
+    n_rows = 1
+    for s in original_shape[:-1]:
+        n_rows *= s
+
+    has_qR = 1 if q_R is not None else 0
+    q_L_flat, q_R_flat, n_heads_real = _prepare_rotors_for_kernel(q_L, q_R, d)
+    dims_arr = mx.array(
+        [d, bits, vpw, packed_dim, has_qR, n_heads_real, rows_per_head],
+        dtype=mx.uint32,
+    )
+
+    outputs = _iso_compress_kernel(
+        inputs=[
+            x.astype(mx.float32).reshape(n_rows, d),
+            q_L_flat, q_R_flat, centroids, dims_arr,
+        ],
+        template=[("T", mx.float32)],
+        grid=(n_rows * d, 1, 1),
+        threadgroup=(d, 1, 1),
+        output_shapes=[(n_rows * packed_dim,), (n_rows,)],
+        output_dtypes=[mx.uint32, mx.float32],
+    )
+    packed = outputs[0].reshape(*original_shape[:-1], packed_dim)
+    norms = outputs[1].reshape(*original_shape[:-1])
+    return packed, norms

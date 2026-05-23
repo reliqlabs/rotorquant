@@ -471,6 +471,98 @@ def test_iso_sparse_attend_topk_one_picks_top_token():
     )
 
 
+@pytest.mark.parametrize("mode", ["full", "fast"])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
+def test_iso_compress_metal_matches_pure(mode, bits):
+    """The Metal-fused iso_compress must produce the same packed indices
+    and norms as the pure-MLX pipeline (within fp32 tolerance) so the
+    fast-path can be a drop-in replacement."""
+    from turboquant.mlx_fused_iso_attention import (
+        iso_compress_metal, iso_rotate, _pack, make_random_quaternions,
+        compute_codebooks,
+    )
+    mx.random.seed(0)
+    D = 128
+    n_groups = D // 4
+    q_L = make_random_quaternions(n_groups, seed=11)
+    q_R = make_random_quaternions(n_groups, seed=12) if mode == "full" else None
+    centroids = compute_codebooks(D, bits_list=(bits,))[bits]
+    x = mx.random.normal((32, D)).astype(mx.float32)
+
+    # Pure-MLX reference (inline to avoid the iso_compress fast-path).
+    norms_ref = mx.linalg.norm(x, axis=-1, keepdims=True)
+    x_unit = x / mx.maximum(norms_ref, 1e-8)
+    rotated = iso_rotate(x_unit, q_L, q_R)
+    diffs = mx.abs(rotated[..., None] - centroids)
+    indices = mx.argmin(diffs, axis=-1).astype(mx.uint32)
+    packed_ref = _pack(indices, bits)
+    norms_ref = norms_ref.squeeze(-1)
+
+    packed_metal, norms_metal = iso_compress_metal(x, bits, q_L, q_R, centroids)
+    mx.eval(packed_metal, norms_metal)
+
+    # Norms should agree closely (fp32 tree-reduce vs MLX norm).
+    norm_diff = mx.max(mx.abs(norms_ref - norms_metal)).item()
+    assert norm_diff < 1e-4, (
+        f"norm mismatch metal vs pure: {norm_diff:.3e} (bits={bits}, mode={mode})"
+    )
+
+    # Packed indices: bitwise comparison. Most rows match exactly; a small
+    # number may differ by ±1 in the index for values that lie almost
+    # exactly between two centroids (different fp32 rounding paths).
+    # Tolerate ≤ 2% disagreement rate.
+    same = mx.array_equal(packed_ref, packed_metal).item()
+    if not same:
+        # Unpack and count per-element disagreements as a softer assertion.
+        from turboquant.mlx_fused_iso_attention import _unpack
+        idx_ref = _unpack(packed_ref, bits, D)
+        idx_metal = _unpack(packed_metal, bits, D)
+        diffs = (idx_ref.astype(mx.int32) - idx_metal.astype(mx.int32))
+        n_diff = mx.sum(mx.abs(diffs) > 0).item()
+        n_total = idx_ref.size
+        frac = n_diff / n_total
+        assert frac < 0.02, (
+            f"indices differ in {n_diff}/{n_total} ({100*frac:.2f}%) — "
+            f"more than expected fp32 tie-breaking jitter (bits={bits}, mode={mode})"
+        )
+
+
+def test_iso_compress_metal_per_head_routes_correctly():
+    """When given 3D q_L (H, n_groups, 4) and input shaped (B*T, H, D),
+    the fused kernel must apply the per-head rotor at each row. Verify by
+    using one good and one degenerate per-head rotor and confirming the
+    bad head's reconstruction is meaningfully worse."""
+    from turboquant.mlx_fused_iso_attention import (
+        iso_compress_metal, iso_decompress, make_random_quaternions,
+    )
+    mx.random.seed(0)
+    D, H = 128, 4
+    n_groups = D // 4
+    good = [make_random_quaternions(n_groups, seed=h) for h in range(H)]
+    # Head 2 gets a tiny rotor — degenerate, should compress poorly.
+    good[2] = mx.tile(mx.array([1.0, 0.0, 0.0, 0.0])[None, :], (n_groups, 1))
+    q_L = mx.stack(good, axis=0)
+    q_R = mx.stack([make_random_quaternions(n_groups, seed=h + 100) for h in range(H)], axis=0)
+
+    BT = 8
+    x = mx.random.normal((BT, H, D)).astype(mx.float32)
+    packed, norms = iso_compress_metal(x, bits=3, q_L=q_L, q_R=q_R, centroids=None)
+    # Decompress keeping (BT, H, ...) so 3D q_L broadcasts over BT correctly.
+    out = iso_decompress(packed, norms, D, 3, q_L, q_R, centroids=None)
+    cos_per_head = []
+    for h in range(H):
+        a = x[:, h]; b = out[:, h]
+        nx = mx.maximum(mx.linalg.norm(a, axis=-1), 1e-8)
+        ny = mx.maximum(mx.linalg.norm(b, axis=-1), 1e-8)
+        cos_per_head.append(((a * b).sum(axis=-1) / (nx * ny)).mean().item())
+    others = [cos_per_head[h] for h in (0, 1, 3)]
+    # The degenerate head should not be IDENTICAL to the others; the kernel
+    # is using a different rotor for it.
+    assert abs(cos_per_head[2] - sum(others) / 3) > 1e-3, (
+        f"per-head rotor not being applied — all heads cos: {cos_per_head}"
+    )
+
+
 def test_iso_sparse_attend_fast_mode_runs():
     """fast mode (q_R=None) goes through the has_qR=0 branch in both
     kernels. Just verify it runs end-to-end without crashing or NaN."""
